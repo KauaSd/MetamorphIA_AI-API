@@ -1,0 +1,1 @@
+#Faz a conexão no ChromaDB, faz os embeddings com o gemini e vai salvar os chunks

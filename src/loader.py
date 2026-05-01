@@ -1,0 +1,1 @@
+#Esse cara vai ler os arquivos da pasta data/raw e faz os chunks das mesmas
