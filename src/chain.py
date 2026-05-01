@@ -1,0 +1,1 @@
+#Chain será quem pega os chunks do retriever, monta um prompt e chama o gemini pra resposta

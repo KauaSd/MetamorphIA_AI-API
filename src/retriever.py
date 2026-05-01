@@ -1,0 +1,1 @@
+#Busca no ChromaDB os chunks parecidos com o que foi perguntado e retorna os resultados

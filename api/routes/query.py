@@ -1,0 +1,1 @@
+#Recebe a mensagem do front (ou da gente por enquanto), chama o chain, que devolve a mensagem e o salvamento no banco relacional 

@@ -1,0 +1,1 @@
+#Recebe um arquivo que queremos fazer entrar no ChromaDB e já chama todo mundo para automaticamente colocar os arquivos no raw
