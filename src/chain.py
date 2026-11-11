@@ -1,12 +1,37 @@
-#Chain será quem pega os chunks do retriever, monta um prompt e chama o gemini pra resposta
-def resposta(pergunta: str):
-    from google import genai
-    import os
-    from dotenv import load_dotenv
-    load_dotenv()
-    client = genai.Client()
-    response=client.models.generate_content(
-        model="gemini-3.5-flash",
-        contents=pergunta
+"""Chain RAG: recupera contexto pedagógico no ChromaDB e gera resposta fundamentada."""
+
+from __future__ import annotations
+
+from llm_client import gerar_resposta
+from src.retriever import buscar_trechos
+
+
+def _montar_contexto(pergunta: str) -> tuple[str, list[dict]]:
+    trechos = buscar_trechos(pergunta)
+    if not trechos:
+        return "Nenhum trecho específico foi recuperado da base documental.", []
+
+    partes = []
+    fontes = []
+    for indice, t in enumerate(trechos, start=1):
+        titulo = t.metadata.get("titulo", t.metadata.get("source", "Fonte Oficial"))
+        partes.append(f"[Trecho {indice} | {titulo}]\n{t.texto}")
+        fontes.append(t.metadata)
+
+    return "\n\n".join(partes), fontes
+
+
+def resposta(pergunta: str) -> str:
+    """Responde à dúvida pedagógica utilizando os documentos semelhantes recuperados."""
+    contexto, fontes = _montar_contexto(pergunta)
+    return gerar_resposta(
+        prompt=pergunta,
+        contexto_rag=contexto,
+        fontes_referencia=fontes,
+        formato_referencias="discreto",
     )
-    return response.text
+
+
+if __name__ == "__main__":
+    pergunta_usuario = input("Pergunta pedagógica para a IA: ")
+    print(resposta(pergunta_usuario))

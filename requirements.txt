@@ -1,0 +1,14 @@
+chromadb==1.5.9
+fastapi==0.141.1
+google-genai==2.19.0
+groq==1.6.0
+httpx>=0.28.1
+langchain-community
+langchain-text-splitters
+pypdf
+python-dotenv==1.2.3
+pydantic-settings>=2.15.0
+pytest>=9.0.0
+pytest-asyncio>=1.4.0
+respx>=0.23.0
+uvicorn[standard]>=0.30.0

@@ -1,5 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Ambientes virtuais
+.venv/
+venv/
+ENV/
+env/
+
+# Configurações de ambiente sensíveis
 .env
-/data/raw
-/node_modules
-**/__pycache__/
-*.pyc
+
+# Testes e cobertura
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Agentes e Skills locais
+.agents/
+
+# Banco de dados e API DB
+api_db/
+
+# Banco vetorial e dados
+data/
