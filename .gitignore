@@ -21,6 +21,7 @@ htmlcov/
 
 # Agentes e Skills locais
 .agents/
+skills-lock.json
 
 # Banco de dados e API DB
 api_db/
