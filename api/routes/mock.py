@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 import json
 from typing import Optional, Union
 import uuid
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from api.routes.pei import (
@@ -20,7 +20,24 @@ from llm_client import gerar_resposta, gerar_resposta_stream
 from memoria.queries import buscar_documentos_referencia
 from schemas import PeiCriarResponse, PeiInicialResponse, PeiRespostaItem
 
-router = APIRouter(prefix="/mock", tags=["mock"])
+_AMBIENTES_PERMITIDOS_MOCK = {"development", "dev", "test", "testing", "homologacao", "homolog", "staging", "local"}
+
+
+def _verificar_ambiente_mock_permitido() -> None:
+    """Garante que as rotas /mock/* respondam 404 caso o ambiente seja alterado para produção."""
+    env = get_settings().ENVIRONMENT.strip().lower()
+    if env not in _AMBIENTES_PERMITIDOS_MOCK:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Rota de desenvolvimento/homologação indisponível em ambiente de produção.",
+        )
+
+
+router = APIRouter(
+    prefix="/mock",
+    tags=["mock"],
+    dependencies=[Depends(_verificar_ambiente_mock_permitido)],
+)
 
 
 class MockChatRequest(BaseModel):

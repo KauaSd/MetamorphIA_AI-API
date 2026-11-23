@@ -66,7 +66,11 @@ PROMPT_SISTEMA_METAMORPHIA = (
     "   - Medicação e Posologia: JAMAIS indique medicamentos, ajustes de dose ou condutas farmacológicas. Esclareça que prescrições são ato exclusivamente médico e redirecione para estratégias pedagógicas em sala de aula.\n"
     "   - Postura Anticapacitista: Diante de desabafos ou falas desacreditando o potencial do estudante (ex: 'nunca vai aprender'), acolha o cansaço do professor sem julgamento, mas reafirme com firmeza ética e base científica que todo estudante pode aprender quando as barreiras são removidas com adaptações adequadas (DUA/PEI).\n"
     "10. Privacidade e Proteção de Dados (LGPD): NUNCA solicite, mencione, armazene ou replique números de CPF, RG, telefones "
-    "ou documentos civis de estudantes, responsáveis ou professores. Mantenha o foco exclusivamente no perfil de aprendizagem e estratégias inclusivas."
+    "ou documentos civis de estudantes, responsáveis ou professores. Mantenha o foco exclusivamente no perfil de aprendizagem e estratégias inclusivas.\n"
+    "11. Veracidade de Recursos (PROIBIDO INVENTAR TÍTULOS OU LINKS): JAMAIS invente títulos fictícios de vídeos do YouTube, "
+    "canais, livros, autores, jogos específicos ou links/URLs que não constem explicitamente nos documentos de referência. "
+    "Ao recomendar vídeos, livros ou jogos, descreva apenas o formato/tipo do recurso, critérios de acessibilidade e palavras-chave "
+    "de busca (sem colocar nomes inventados entre aspas)."
 )
 
 
@@ -83,7 +87,9 @@ def _montar_prompt_completo(prompt_usuario: str, contexto_rag: Optional[str] = N
     )
 
 
-def _gerar_via_groq(prompt: str, api_key: str, model: str) -> str:
+def _gerar_via_groq(
+    prompt: str, api_key: str, model: str, system_prompt: Optional[str] = None
+) -> str:
     """Gera resposta síncrona através da API da Groq."""
     if not Groq:
         raise RuntimeError("Biblioteca 'groq' não instalada.")
@@ -91,7 +97,7 @@ def _gerar_via_groq(prompt: str, api_key: str, model: str) -> str:
     completion = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": PROMPT_SISTEMA_METAMORPHIA},
+            {"role": "system", "content": system_prompt or PROMPT_SISTEMA_METAMORPHIA},
             {"role": "user", "content": prompt},
         ],
         temperature=0.4,
@@ -158,13 +164,16 @@ def _aguardar_cota_gemini(
         time.sleep(espera)
 
 
-def _gerar_via_gemini(prompt: str, api_key: str, model: str) -> str:
+def _gerar_via_gemini(
+    prompt: str, api_key: str, model: str, system_prompt: Optional[str] = None
+) -> str:
     """Gera resposta síncrona através da API Google Gemini respeitando os limites de RPM (15) e RPD (500)."""
     if not genai:
         raise RuntimeError("Biblioteca 'google-genai' não instalada.")
     _aguardar_cota_gemini()
     client = genai.Client(api_key=api_key)
-    prompt_completo = f"Instrução do Sistema:\n{PROMPT_SISTEMA_METAMORPHIA}\n\n{prompt}"
+    sys_msg = system_prompt or PROMPT_SISTEMA_METAMORPHIA
+    prompt_completo = f"Instrução do Sistema:\n{sys_msg}\n\n{prompt}"
     response = client.models.generate_content(model=model, contents=prompt_completo)
     return response.text or ""
 
@@ -200,6 +209,7 @@ def gerar_resposta(
     model: Optional[str] = None,
     aplicar_guardrails: bool = True,
     formato_referencias: str = "discreto",
+    system_prompt: Optional[str] = None,
 ) -> str:
     """Pipeline principal de geração de resposta da MetamorphIA.
 
@@ -235,14 +245,14 @@ def gerar_resposta(
         if api_key:
             try:
                 resposta_bruta = _gerar_via_gemini(
-                    prompt_final, api_key, model or settings.GEMINI_MODEL
+                    prompt_final, api_key, model or settings.GEMINI_MODEL, system_prompt=system_prompt
                 )
             except Exception:
                 groq_key = settings.GROQ_API_KEY or os.getenv("GROQ_API_KEY")
                 if groq_key:
                     try:
                         resposta_bruta = _gerar_via_groq(
-                            prompt_final, groq_key, model or settings.GROQ_MODEL
+                            prompt_final, groq_key, model or settings.GROQ_MODEL, system_prompt=system_prompt
                         )
                     except Exception:
                         resposta_bruta = _gerar_via_mock(prompt_final)
@@ -255,14 +265,14 @@ def gerar_resposta(
         if api_key:
             try:
                 resposta_bruta = _gerar_via_groq(
-                    prompt_final, api_key, model or settings.GROQ_MODEL
+                    prompt_final, api_key, model or settings.GROQ_MODEL, system_prompt=system_prompt
                 )
             except Exception:
                 gemini_key = settings.GEMINI_API_KEY or os.getenv("GEMINI_API_KEY")
                 if gemini_key:
                     try:
                         resposta_bruta = _gerar_via_gemini(
-                            prompt_final, gemini_key, model or settings.GEMINI_MODEL
+                            prompt_final, gemini_key, model or settings.GEMINI_MODEL, system_prompt=system_prompt
                         )
                     except Exception:
                         resposta_bruta = _gerar_via_mock(prompt_final)

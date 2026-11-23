@@ -6,9 +6,11 @@ httpx>=0.28.1
 langchain-community
 langchain-text-splitters
 pypdf
+PyJWT>=2.8.0
 python-dotenv==1.2.3
 pydantic-settings>=2.15.0
 pytest>=9.0.0
 pytest-asyncio>=1.4.0
 respx>=0.23.0
+slowapi>=0.1.9
 uvicorn[standard]>=0.30.0

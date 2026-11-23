@@ -5,6 +5,7 @@ import copy
 import glob
 import io
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -24,6 +25,7 @@ from memoria.queries import (
     buscar_contexto_aluno,
     buscar_documentos_referencia,
     listar_peis_aluno,
+    obter_contexto_peis_aluno,
     obter_pei_por_id,
     obter_ultimo_perfil,
 )
@@ -31,6 +33,7 @@ from schemas import (
     PeiCriarRequest,
     PeiCriarResponse,
     PeiDetalhe,
+    PeiImportarRequest,
     PeiInicialRequest,
     PeiInicialResponse,
     PeiPerguntaGeralRoteiro,
@@ -42,6 +45,61 @@ from schemas import (
 router = APIRouter(tags=["pei"])
 
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+PROMPT_SISTEMA_PEI = (
+    "Você é um redator pedagógico especializado na elaboração do Plano Educacional Individualizado (PEI - "
+    "Anexo IV da Resolução SEDUC nº 129/2025) seguindo rigorosamente o Roteiro MetamorphIA.\n\n"
+    "REGRAS OBRIGATÓRIAS DE REDAÇÃO E FORMATAÇÃO DO PEI:\n"
+    "1. NUNCA inclua citações de fontes, referências bibliográficas, '*Fonte base:...*', 'Fonte:', 'Referências:' "
+    "ou menções a arquivos/documentos de apoio no texto do PEI.\n"
+    "2. NUNCA use tabelas (proibido usar tabelas Markdown com '|', separadores '|---|' ou quadros tabulares).\n"
+    "3. NUNCA use marcações Markdown cruas como '**negrito**', '*itálico*', '### títulos' ou blocos de código.\n"
+    "4. NUNCA inclua saudações ('Olá, professor!'), conversas paralelas ou explicações fora do texto oficial do PEI.\n"
+    "5. Escreva em português claro, objetivo e profissional, usando apenas parágrafos corridos e, quando útil, "
+    "tópicos simples iniciados por '• '.\n"
+    "6. NUNCA invente títulos fictícios de vídeos do YouTube, canais, livros, autores, jogos comerciais ou links/URLs; "
+    "indique apenas formatos/tipos de recursos pedagógicos, critérios de acessibilidade e termos de busca.\n"
+    "7. Privacidade LGPD: jamais inclua CPF, RG, telefone ou documentos civis."
+)
+
+
+def _limpar_texto_resposta_pei(texto: str) -> str:
+    """Remove fontes, tabelas Markdown e marcações cruas que não pertencem ao documento PEI."""
+    if not texto:
+        return ""
+    linhas_limpas: list[str] = []
+    for linha in str(texto).splitlines():
+        ln = linha.strip()
+        if not ln:
+            if linhas_limpas and linhas_limpas[-1] != "":
+                linhas_limpas.append("")
+            continue
+        # Remove linhas de fonte/referência
+        if re.match(r"^\*{0,2}\s*(?:📚\s*)?(?:fonte(?:\s+base)?|refer[eê]ncias?|baseado\s+em)\s*[:\-]", ln, flags=re.I):
+            continue
+        # Remove linha separadora de tabela Markdown (ex: | --- | --- |)
+        if re.match(r"^\|?[\s:\-]+\|[\s:\-\|]*$", ln):
+            continue
+        # Converte eventual linha de tabela Markdown (| a | b |) em tópico simples
+        if ln.startswith("|") and ln.endswith("|") and ln.count("|") >= 2:
+            celulas = [c.strip() for c in ln.strip("|").split("|") if c.strip()]
+            if not celulas:
+                continue
+            # Ignora cabeçalhos genéricos de tabela
+            if all(
+                c.lower() in ("habilidade", "habilidades", "conteúdo", "conteúdos", "adaptação", "adaptações", "estratégia", "estratégias", "recurso", "recursos", "categoria", "descrição", "objetivo", "instrumento", "avaliação")
+                for c in celulas
+            ):
+                continue
+            ln = "• " + " — ".join(celulas)
+        # Remove marcações Markdown cruas
+        ln = re.sub(r"^#{1,6}\s+", "", ln)
+        ln = re.sub(r"\*\*(.*?)\*\*", r"\1", ln)
+        ln = re.sub(r"__(.*?)__", r"\1", ln)
+        ln = re.sub(r"(?<!\*)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)", r"\1", ln)
+        ln = re.sub(r"^\s*[-*]\s+", "• ", ln)
+        linhas_limpas.append(ln)
+    return "\n".join(linhas_limpas).strip()
 
 _PEI_DOCX_MEMORIA: dict[str, bytes] = {}
 
@@ -256,25 +314,33 @@ def gerar_roteiro_pei_inicial(
             f"- '2.2': Subpergunta 'Quais intervenções pedagógicas você utilizará para que o estudante consiga participar das aulas?' (Critérios: apoio individual em atividades complexas, adaptação de quantidade, adaptação de complexidade, ajuste da forma de participação oral/pictograma/escrita/digital).\n"
             f"- '2.3': Subpergunta 'Quais recursos de acessibilidade você utilizará para que o estudante consiga participar das aulas?' (Critérios: material ampliado/contrastes/fontes acessíveis, figuras/esquemas/pictogramas/CAA, uso de tablet/computador, fones/abafadores/mobiliário adaptado, tecnologias assistivas).\n"
             f"- '3.1': Subpergunta 'Como você vai avaliar o estudante respeitando seu ritmo, suas necessidades e suas formas de expressão?' (Critérios: observação diária, portfólio, avaliações práticas, checklist de habilidades, registro fotográfico, autoavaliação com apoio visual, conversas orientadas, produções em vídeo/áudio/desenho, rubricas; avaliando o progresso do aluno em relação a ele mesmo).\n"
-            f"- '4.1': Subpergunta 'Quais vídeos, livros, jogos, exercícios ou outras atividades você indicará para apoiar e fortalecer o aprendizado do estudante?' (Critérios: 1 opção de Vídeos, 1 opção de Livros, 1 opção de Jogos e 1 opção de Atividades/exercícios adaptados ao componente curricular e ao aluno).\n\n"
+            f"- '4.1': Subpergunta 'Quais vídeos, livros, jogos, exercícios ou outras atividades você indicará para apoiar e fortalecer o aprendizado do estudante?' (Critérios: 1 opção de Vídeos, 1 opção de Livros, 1 opção de Jogos e 1 opção de Atividades/exercícios adaptados ao componente curricular e ao aluno. REGRA CRÍTICA: NUNCA invente títulos fictícios de vídeos do YouTube, livros, canais, autores ou links; descreva apenas o formato/tipo do recurso, critérios de acessibilidade e termos/temas de busca sem nomes inventados entre aspas).\n\n"
             f"Retorne APENAS um objeto JSON válido com a chave 'conteudo_previsto' (string descrevendo o conteúdo previsto do Currículo Paulista "
             f"para este ano/bimestre em {componente_curricular}) e a chave 'subperguntas' contendo as chaves '1.1', '1.2', '1.3', '2.1', '2.2', '2.3', '3.1', '4.1', "
             f"onde cada chave possui uma lista de EXATAMENTE 4 strings."
         )
         try:
-            resposta_llm = gerar_resposta(prompt=prompt_opcoes, aplicar_guardrails=False)
+            resposta_llm = gerar_resposta(
+                prompt=prompt_opcoes,
+                aplicar_guardrails=False,
+                system_prompt=PROMPT_SISTEMA_PEI,
+            )
             inicio = resposta_llm.find("{")
             fim = resposta_llm.rfind("}")
             if inicio != -1 and fim != -1 and fim > inicio:
                 dados_json = json.loads(resposta_llm[inicio : fim + 1])
                 if isinstance(dados_json.get("conteudo_previsto"), str) and dados_json["conteudo_previsto"].strip():
-                    conteudo_previsto = dados_json["conteudo_previsto"].strip()
+                    conteudo_previsto = _limpar_texto_resposta_pei(dados_json["conteudo_previsto"])
                 subs_json = dados_json.get("subperguntas", {})
                 if isinstance(subs_json, dict):
                     for k in list(opcoes_por_sub.keys()):
                         lista_cand = subs_json.get(k)
                         if isinstance(lista_cand, list):
-                            limpas = [str(x).strip() for x in lista_cand if str(x).strip()]
+                            limpas = [
+                                _limpar_texto_resposta_pei(str(x))
+                                for x in lista_cand
+                                if _limpar_texto_resposta_pei(str(x))
+                            ]
                             if len(limpas) >= 4:
                                 opcoes_por_sub[k] = limpas[:4]
         except Exception:
@@ -519,9 +585,14 @@ def gerar_respostas_gerais_pei(
             f"Estudante: {nome_aluno} | Idade: {idade_aluno or 'Não informada'} | Neurodivergência: {neurodivergencia}\n"
             f"Componente Curricular: {componente_curricular} | Ano: {ano_escolar} | Bimestre: {periodo_bimestre}º\n"
             f"Contexto do Estudante: {contexto_aluno}\n\n"
-            f"REGRA OBRIGATÓRIA:\n"
+            f"REGRA OBRIGATÓRIA (ROTEIRO METAMORPHIA):\n"
             f"- Gere a resposta APENAS para cada uma das 4 Perguntas Gerais (NÃO repita as subperguntas como perguntas no texto final e NÃO inclua textos explicativos azuis).\n"
-            f"- Considere todas as respostas das subperguntas como dados para construir a resposta de cada Pergunta Geral, seguindo rigorosamente o norteamento em vermelho.\n\n"
+            f"- Considere todas as respostas das subperguntas como dados para construir a resposta de cada Pergunta Geral, seguindo rigorosamente o norteamento em vermelho do Roteiro MetamorphIA.\n"
+            f"- Na Pergunta 1, contemple: conteúdos/habilidades do Currículo Paulista escolhidos, o que o estudante já consegue fazer (consolidadas, em desenvolvimento, com ajuda), adaptações necessárias, recursos/apoios previstos e articulação do planejamento com o professor especializado do AEE.\n"
+            f"- Na Pergunta 2, integre estratégias pedagógicas, intervenções pedagógicas e recursos de acessibilidade segundo o DUA e articulados entre sala comum, AEE e gestão escolar (respeitando se o professor indicou que não utilizará algum item).\n"
+            f"- Na Pergunta 3, descreva os instrumentos diversificados e acessíveis de avaliação, reforçando o princípio de avaliar o progresso do estudante em relação a ele mesmo.\n"
+            f"- Na Pergunta 4, organize nos 4 grupos do Roteiro (Vídeos, Livros, Jogos, Atividades e exercícios) adaptados ao componente curricular e ao aluno, SEM inventar títulos fictícios de vídeos (ex: YouTube), livros, canais, autores ou URLs.\n"
+            f"- FORMATAÇÃO: escreva em texto corrido e tópicos simples ('• '). É PROIBIDO usar tabelas (Markdown ou quadros), marcações Markdown ('**', '###') e é PROIBIDO incluir citações de fonte ('*Fonte base:...*', 'Fonte:', 'Referências:').\n\n"
             f"Pergunta Geral 1: {PERGUNTAS_GERAIS_MODELO[1]}\n"
             f"Norteamento obrigatório 1: {NORTEAMENTO_VERMELHO_PERGUNTAS_GERAIS[1]}\n"
             f"Dados das subperguntas 1:\n{dados_p1}\n\n"
@@ -534,14 +605,15 @@ def gerar_respostas_gerais_pei(
             f"Pergunta Geral 4: {PERGUNTAS_GERAIS_MODELO[4]}\n"
             f"Norteamento obrigatório 4: {NORTEAMENTO_VERMELHO_PERGUNTAS_GERAIS[4]}\n"
             f"Dados das subperguntas 4:\n{dados_p4}\n\n"
-            f"Retorne APENAS um JSON válido com as chaves '1', '2', '3' e '4', contendo o texto completo e bem redigido de cada resposta geral."
+            f"Retorne APENAS um JSON válido com as chaves '1', '2', '3' e '4', contendo o texto limpo (sem tabelas, sem Markdown e sem fontes) de cada resposta geral."
         )
         try:
             texto_ia = gerar_resposta(
                 prompt=prompt_geral,
                 contexto_rag=contexto_rag,
-                fontes_referencia=fontes_docs,
+                fontes_referencia=None,
                 aplicar_guardrails=False,
+                system_prompt=PROMPT_SISTEMA_PEI,
             )
             ini = texto_ia.find("{")
             fim = texto_ia.rfind("}")
@@ -550,7 +622,9 @@ def gerar_respostas_gerais_pei(
                 for num in (1, 2, 3, 4):
                     val = parsed.get(str(num)) or parsed.get(f"pergunta_{num}")
                     if isinstance(val, str) and len(val.strip()) > 20:
-                        respostas_padrao[num] = sanitizar_dados_sensiveis(val.strip())[0]
+                        limpo = _limpar_texto_resposta_pei(sanitizar_dados_sensiveis(val.strip())[0])
+                        if len(limpo) > 20:
+                            respostas_padrao[num] = limpo
         except Exception:
             pass
 
@@ -798,8 +872,9 @@ async def criar_pei_inicial(
       subperguntas do roteiro com 4 possíveis respostas geradas para cada subpergunta.
     """
     req = payload or PeiInicialRequest()
+    token_jwt = usuario_autenticado.get("_raw_token")
     try:
-        aluno = await obter_aluno(id_aluno)
+        aluno = await obter_aluno(id_aluno, token=token_jwt)
     except ResourceNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -814,19 +889,22 @@ async def criar_pei_inicial(
     if req.descricao_aluno and req.descricao_aluno.strip():
         desc_limpa, _ = sanitizar_dados_sensiveis(req.descricao_aluno.strip())
         try:
-            await atualizar_descricao_aluno(id_aluno, desc_limpa)
+            await atualizar_descricao_aluno(id_aluno, desc_limpa, token=token_jwt)
         except Exception:
             pass
     else:
         desc_limpa = None
 
     ultimo_perfil = obter_ultimo_perfil(id_aluno)
+    contexto_peis_anteriores = obter_contexto_peis_aluno(id_aluno, limite_peis=1, max_chars_por_pei=1500)
     contexto_aluno = _obter_contexto_consolidado_aluno(
         desc_aluno=aluno.desc_aluno,
         perfil_ia=aluno.perfil_ia,
         ultimo_perfil_memoria=ultimo_perfil,
         descricao_enviada=desc_limpa,
     )
+    if contexto_peis_anteriores:
+        contexto_aluno = f"{contexto_aluno}\n\nPEI ANTERIOR DO ALUNO:\n{contexto_peis_anteriores}".strip()
 
     nome_aluno_limpo, _ = sanitizar_dados_sensiveis(aluno.nome_aluno)
     neuro_limpa, _ = sanitizar_dados_sensiveis(aluno.neurodiv_aluno)
@@ -849,7 +927,7 @@ async def _processar_criacao_pei(
     usuario_autenticado: dict[str, Any],
 ) -> tuple[PeiCriarResponse, bytes]:
     try:
-        aluno = await obter_aluno(id_aluno)
+        aluno = await obter_aluno(id_aluno, token=usuario_autenticado.get("_raw_token"))
     except ResourceNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1020,13 +1098,38 @@ async def criar_pei_docx(
     )
 
 
+async def _verificar_acesso_aluno_pei(id_aluno: int, usuario_autenticado: dict[str, Any]) -> None:
+    """Valida na API-DB que o aluno existe e que o usuário autenticado tem permissão de acesso (prevenção de BOLA/IDOR)."""
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        await obter_aluno(id_aluno, token=token_jwt)
+    except ResourceNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Aluno {id_aluno} não encontrado na base de dados.",
+        )
+    except Exception as exc:
+        msg = str(exc)
+        if "HTTP 403" in msg:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Você não tem permissão para acessar os dados deste aluno.",
+            )
+        if "HTTP 401" in msg:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Credenciais inválidas para consulta na API-DB.",
+            )
+
+
 @router.get("/alunos/{id_aluno}/pei/{pei_id}/docx")
 async def baixar_pei_docx(
     id_aluno: int,
     pei_id: str,
-    _usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
+    usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> Response:
     """Baixa o arquivo .docx de um PEI já gerado."""
+    await _verificar_acesso_aluno_pei(id_aluno, usuario_autenticado)
     docx_bytes = _PEI_DOCX_MEMORIA.get(pei_id)
     if not docx_bytes:
         pei = obter_pei_por_id(id_aluno, pei_id)
@@ -1054,9 +1157,10 @@ async def baixar_pei_docx(
 @router.get("/alunos/{id_aluno}/pei", response_model=list[PeiResumo])
 async def get_peis_aluno(
     id_aluno: int,
-    _usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
+    usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> list[PeiResumo]:
     """Lista todos os PEIs registrados para o estudante."""
+    await _verificar_acesso_aluno_pei(id_aluno, usuario_autenticado)
     peis = listar_peis_aluno(id_aluno)
     return [PeiResumo(**p) for p in peis]
 
@@ -1065,9 +1169,10 @@ async def get_peis_aluno(
 async def get_pei_detalhe(
     id_aluno: int,
     pei_id: str,
-    _usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
+    usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> PeiDetalhe:
     """Busca o conteúdo na íntegra de um PEI específico."""
+    await _verificar_acesso_aluno_pei(id_aluno, usuario_autenticado)
     pei = obter_pei_por_id(id_aluno, pei_id)
     if not pei:
         raise HTTPException(
@@ -1075,3 +1180,95 @@ async def get_pei_detalhe(
             detail="PEI não encontrado para este aluno.",
         )
     return PeiDetalhe(**pei)
+
+
+@router.post("/alunos/{id_aluno}/pei/importar", response_model=PeiCriarResponse)
+async def importar_pei_arquivo(
+    id_aluno: int,
+    payload: PeiImportarRequest,
+    usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
+) -> PeiCriarResponse:
+    """Importa um arquivo de PEI existente (.pdf, .docx, .txt), extrai seu conteúdo,
+    atualiza o contexto do aluno e registra o PEI estruturado para download e uso no chat.
+    """
+    from arquivo_utils import decodificar_base64_ou_data_url, extrair_texto_arquivo
+
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        aluno = await obter_aluno(id_aluno, token=token_jwt)
+    except ResourceNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Aluno {id_aluno} não encontrado na base de dados.",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Erro de comunicação com a API-DB: {exc}",
+        )
+
+    raw_bytes = decodificar_base64_ou_data_url(payload.arquivo_base64)
+    if not raw_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Não foi possível decodificar o arquivo enviado.",
+        )
+
+    texto_extraido = extrair_texto_arquivo(payload.arquivo_nome, raw_bytes)
+    texto_limpo, _ = sanitizar_dados_sensiveis(texto_extraido or f"PEI importado: {payload.arquivo_nome}")
+
+    try:
+        await atualizar_descricao_aluno(id_aluno, texto_limpo[:4500], token=token_jwt)
+    except Exception:
+        pass
+
+    nome_aluno_limpo, _ = sanitizar_dados_sensiveis(aluno.nome_aluno)
+    componente = payload.componente_curricular or "Língua Portuguesa"
+    bimestre = payload.periodo_bimestre if payload.periodo_bimestre in (1, 2, 3, 4) else 1
+
+    if payload.arquivo_nome.lower().endswith(".docx"):
+        docx_bytes = raw_bytes
+    else:
+        docx_bytes = montar_docx_pei(
+            nome_aluno=nome_aluno_limpo,
+            respostas_gerais={
+                1: texto_limpo[:1500] or "Conteúdo importado do documento original.",
+                2: "Estratégias e recursos importados do PEI do estudante.",
+                3: "Avaliação processual e contínua conforme PEI importado.",
+                4: "Recursos complementares conforme documento importado.",
+            },
+            componente_curricular=componente,
+            periodo_bimestre=bimestre,
+        )
+
+    pei_id = str(uuid.uuid4())
+    data_iso = datetime.now(timezone.utc).isoformat()
+    _PEI_DOCX_MEMORIA[pei_id] = docx_bytes
+
+    id_prof = int(payload.id_prof or usuario_autenticado.get("id_prof") or 1)
+    salvar_documento(
+        id_aluno=id_aluno,
+        id_turma=aluno.id_turma or 0,
+        id_prof=id_prof,
+        tipo="pei_documento",
+        conteudo=texto_limpo,
+        id_doc=pei_id,
+        data_iso=data_iso,
+        titulo=f"PEI Importado - {nome_aluno_limpo} - {data_iso[:10]}",
+    )
+
+    nome_seguro = "".join(c if c.isalnum() else "_" for c in nome_aluno_limpo).strip("_") or f"aluno_{id_aluno}"
+    arquivo_nome = f"PEI_{nome_seguro}_{bimestre}Bim_2026.docx"
+
+    return PeiCriarResponse(
+        pei_id=pei_id,
+        documento_gerado=texto_limpo,
+        data=data_iso,
+        formato="docx",
+        arquivo_nome=arquivo_nome,
+        respostas_gerais={
+            PERGUNTAS_GERAIS_MODELO[1]: texto_limpo,
+        },
+        documento_docx_base64=base64.b64encode(docx_bytes).decode("ascii"),
+        download_url=f"/alunos/{id_aluno}/pei/{pei_id}/docx",
+    )

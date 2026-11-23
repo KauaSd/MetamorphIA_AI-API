@@ -1,4 +1,4 @@
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from pydantic import AliasChoices, BaseModel, Field
 from diagnostico_utils import StatusDiagnostico
 
@@ -31,24 +31,48 @@ class TurmaDB(BaseModel):
     )
 
 
+class AnexoItem(BaseModel):
+    name: str
+    type: Optional[str] = "application/octet-stream"
+    size: Optional[int] = 0
+    dataUrl: Optional[str] = None
+
+
 class ChatRequest(BaseModel):
-    id_prof: int
-    mensagem: str
+    id_prof: int = 1
+    mensagem: str = ""
     conversa_id: Optional[str] = None
     historico: Optional[List[Dict[str, str]]] = None
     total_interacoes: Optional[int] = None
+    anexos: Optional[List[AnexoItem]] = None
+    gerar_arquivo_atividade: Optional[bool] = None
+    modo_adaptacao: Optional[str] = None
+    template_id: Optional[str] = None
+    formato_saida: Optional[str] = "docx"
+    instrucoes_ia: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
     resposta: str
     conversa_id: str
     perfil_atualizado: Optional[str] = None
+    anexos: Optional[List[AnexoItem]] = None
+    atividade_id: Optional[str] = None
+    arquivo_nome: Optional[str] = None
+    documento_docx_base64: Optional[str] = None
+    documento_pdf_base64: Optional[str] = None
+    download_url: Optional[str] = None
+    opcoes_adaptacao: Optional[List[Dict[str, Any]]] = None
+    modo_adaptacao_usado: Optional[str] = None
+    template_usado: Optional[str] = None
+    formato_arquivo: Optional[str] = None
 
 
 class MensagemItem(BaseModel):
     role: str
     conteudo: str
     data: str
+    anexos: Optional[List[AnexoItem]] = None
 
 
 class ConversaResumo(BaseModel):
@@ -75,6 +99,24 @@ class AlunoDashboardResponse(BaseModel):
     engajamento_percent: int
     desempenho_por_area: Dict[str, int]
     historico_conversas: List[ConversaResumo]
+
+
+class TurmaDashboardResponse(BaseModel):
+    id_turma: int
+    nome_turma: str
+    total_alunos: int
+    alunos_com_pei_ativo: int
+    adaptacoes_feitas: int
+    resumo: str
+    engajamento_por_area: Dict[str, int]
+
+
+class PeiImportarRequest(BaseModel):
+    id_prof: Optional[int] = 1
+    arquivo_nome: str
+    arquivo_base64: str
+    componente_curricular: Optional[str] = "Língua Portuguesa"
+    periodo_bimestre: Optional[int] = 1
 
 
 class PeiSubperguntaItem(BaseModel):

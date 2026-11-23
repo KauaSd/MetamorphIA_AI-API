@@ -47,7 +47,23 @@ def verificar_token_jwt(
             detail="Token inválido: identificador de usuário ausente",
             headers={"WWW-Authenticate": "Bearer"},
         )
-
+    if payload.get("is_verified") is False or payload.get("2fa"):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token pendente de verificação de segundo fator (2FA)",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    settings = get_settings()
+    permitidos_raw = (getattr(settings, "AI_ALLOWED_EMAILS", "") or "").strip()
+    if permitidos_raw:
+        permitidos = {e.strip().lower() for e in permitidos_raw.split(",") if e.strip()}
+        email_token = (payload.get("email") or "").strip().lower()
+        if not email_token or email_token not in permitidos:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="O acesso à IA está temporariamente restrito à conta autorizada.",
+            )
+    payload["_raw_token"] = credentials.credentials
     return payload
 
 
@@ -63,7 +79,7 @@ def validar_permissao_chat_usuario(payload: dict[str, Any]) -> None:
     if pode_chat is False:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Este perfil de administrador Pro+ está configurado sem acesso ao chat dos alunos.",
+            detail="Este perfil de administrador está configurado sem acesso ao chat dos alunos.",
         )
 
 
