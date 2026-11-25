@@ -1,5 +1,6 @@
-from typing import Any, Dict, List, Optional
-from pydantic import AliasChoices, BaseModel, Field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 from diagnostico_utils import StatusDiagnostico
 
 
@@ -11,6 +12,9 @@ class AlunoDB(BaseModel):
     )
     desc_aluno: Optional[str] = None
     perfil_ia: Optional[str] = None
+    indicadores_desenvolvimento: Optional[List[Dict[str, Any]]] = None
+    metas_bimestre: Optional[List[Dict[str, Any]]] = None
+    peis_disciplinas: List[Dict[str, Any]] = Field(default_factory=list)
     idade_aluno: Optional[int] = None
     id_prof: Optional[int] = Field(
         default=None, validation_alias=AliasChoices("id_prof", "fk_Usuario_id_usuario")
@@ -18,6 +22,25 @@ class AlunoDB(BaseModel):
     id_turma: Optional[int] = Field(
         default=None, validation_alias=AliasChoices("id_turma", "fk_Turma_id_turma")
     )
+    pei_feito: bool = False
+    pei_valido_ate: Optional[str] = None
+    pei_ativo: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _resolver_pei_ativo(self) -> "AlunoDB":
+        if self.pei_ativo is not None:
+            return self
+        if not self.pei_feito or not self.pei_valido_ate:
+            self.pei_ativo = False
+            return self
+        try:
+            dt = datetime.fromisoformat(self.pei_valido_ate.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            self.pei_ativo = dt > datetime.now(timezone.utc)
+        except Exception:
+            self.pei_ativo = False
+        return self
 
 
 class TurmaDB(BaseModel):
@@ -39,7 +62,7 @@ class AnexoItem(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    id_prof: int = 1
+    id_prof: Optional[int] = None
     mensagem: str = ""
     conversa_id: Optional[str] = None
     historico: Optional[List[Dict[str, str]]] = None
@@ -50,12 +73,15 @@ class ChatRequest(BaseModel):
     template_id: Optional[str] = None
     formato_saida: Optional[str] = "docx"
     instrucoes_ia: Optional[str] = None
+    persistido_pelo_gateway: bool = False
 
 
 class ChatResponse(BaseModel):
     resposta: str
     conversa_id: str
     perfil_atualizado: Optional[str] = None
+    indicadores_desenvolvimento: Optional[List["IndicadorDesenvolvimentoItem"]] = None
+    metas_bimestre: Optional[List["MetaBimestreItem"]] = None
     anexos: Optional[List[AnexoItem]] = None
     atividade_id: Optional[str] = None
     arquivo_nome: Optional[str] = None
@@ -86,6 +112,42 @@ class ConversaDetalhe(BaseModel):
     mensagens: List[MensagemItem]
 
 
+class DisciplinaItem(BaseModel):
+    id: str
+    nome: str
+
+
+class PeiDisciplinaItem(BaseModel):
+    id: str
+    disciplina: str
+    status: Literal["concluido", "em_andamento", "nao_iniciado"]
+
+
+class PeisPorDisciplinaResumo(BaseModel):
+    status_geral: str
+    concluidos: int
+    total: int
+    ultimo_envio: Optional[str] = None
+    proximo_periodo: Optional[str] = None
+    disciplinas: List[PeiDisciplinaItem] = Field(default_factory=list)
+
+
+class MetaBimestreItem(BaseModel):
+    id: str
+    titulo: str
+    status: Literal["em_progresso", "a_iniciar", "atingida"]
+
+
+class IndicadorDesenvolvimentoItem(BaseModel):
+    id: str
+    titulo: str
+    escala_esquerda: str
+    escala_centro: str
+    escala_direita: str
+    nivel: int = Field(..., ge=1, le=5)
+    cor: Literal["warning", "accent", "info", "success"]
+
+
 class AlunoDashboardResponse(BaseModel):
     id_aluno: int
     nome: str
@@ -99,6 +161,9 @@ class AlunoDashboardResponse(BaseModel):
     engajamento_percent: int
     desempenho_por_area: Dict[str, int]
     historico_conversas: List[ConversaResumo]
+    peis_por_disciplina: Optional[PeisPorDisciplinaResumo] = None
+    metas_bimestre: List[MetaBimestreItem] = Field(default_factory=list)
+    indicadores_desenvolvimento: List[IndicadorDesenvolvimentoItem] = Field(default_factory=list)
 
 
 class TurmaDashboardResponse(BaseModel):
@@ -112,11 +177,12 @@ class TurmaDashboardResponse(BaseModel):
 
 
 class PeiImportarRequest(BaseModel):
-    id_prof: Optional[int] = 1
+    id_prof: Optional[int] = None
     arquivo_nome: str
     arquivo_base64: str
     componente_curricular: Optional[str] = "Língua Portuguesa"
     periodo_bimestre: Optional[int] = 1
+    persistido_pelo_gateway: bool = False
 
 
 class PeiSubperguntaItem(BaseModel):
@@ -142,7 +208,7 @@ class PeiPerguntaGeralRoteiro(BaseModel):
 
 
 class PeiInicialRequest(BaseModel):
-    id_prof: Optional[int] = 1
+    id_prof: Optional[int] = None
     descricao_aluno: Optional[str] = Field(
         default=None,
         description="Descrição do estudante em pelo menos 5 linhas (quando for o primeiro PEI e não houver contexto prévio)",
@@ -176,7 +242,7 @@ class PeiRespostaItem(BaseModel):
 
 
 class PeiCriarRequest(BaseModel):
-    id_prof: Optional[int] = 1
+    id_prof: Optional[int] = None
     respostas: List[PeiRespostaItem] = Field(default_factory=list)
     nome_professor_regente: Optional[str] = None
     nome_professor_especializado: Optional[str] = None
@@ -184,6 +250,7 @@ class PeiCriarRequest(BaseModel):
     ano_escolar: Optional[str] = "Ensino Fundamental"
     periodo_bimestre: Optional[int] = 1
     descricao_aluno: Optional[str] = None
+    persistido_pelo_gateway: bool = False
 
 
 class PeiCriarResponse(BaseModel):
@@ -195,6 +262,11 @@ class PeiCriarResponse(BaseModel):
     respostas_gerais: Optional[Dict[str, str]] = None
     documento_docx_base64: Optional[str] = None
     download_url: Optional[str] = None
+    perfil_atualizado: Optional[str] = None
+    indicadores_desenvolvimento: Optional[List[IndicadorDesenvolvimentoItem]] = None
+    metas_bimestre: Optional[List[MetaBimestreItem]] = None
+    pei_feito: bool = True
+    pei_valido_ate: Optional[str] = None
 
 
 class PeiResumo(BaseModel):
@@ -210,7 +282,14 @@ class PeiDetalhe(BaseModel):
     data: str
 
 
+class PerfilGerarRequest(BaseModel):
+    historico_conversas: Optional[str] = None
+    persistido_pelo_gateway: bool = False
+
+
 class PerfilGerarResponse(BaseModel):
     id_aluno: int
     perfil_gerado: str
     sincronizado_api_db: bool
+    indicadores_desenvolvimento: Optional[List[IndicadorDesenvolvimentoItem]] = None
+    metas_bimestre: Optional[List[MetaBimestreItem]] = None

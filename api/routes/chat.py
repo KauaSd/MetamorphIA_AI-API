@@ -22,34 +22,37 @@ from templates_atividades import (
     recomendar_templates_para_perfil,
 )
 from auth_jwt import validar_permissao_chat_usuario, verificar_token_jwt
-from db_client import ResourceNotFoundError, obter_aluno
-from guardrails import sanitizar_dados_sensiveis, validar_e_higienizar_entrada
-from llm_client import gerar_resposta
-from memoria.chroma_client import salvar_documento
-from memoria.queries import (
-    buscar_contexto_aluno,
-    buscar_documentos_referencia,
-    excluir_conversa_aluno,
-    listar_conversas_aluno,
-    listar_peis_aluno,
-    obter_contexto_peis_aluno,
-    obter_mensagens_conversa,
-    obter_pei_por_id,
+from cache_utils import BoundedTTLCache
+from db_client import (
+    baixar_pei_docx_db,
+    excluir_conversa_aluno_db,
+    levantar_http_de_erro_db,
+    listar_conversas_aluno_db,
+    listar_peis_aluno_db,
+    obter_aluno,
+    obter_mensagens_conversa_db,
+    registrar_turno_conversa_db,
 )
+from guardrails import sanitizar_dados_sensiveis, validar_e_higienizar_entrada
+from llm_client import gerar_resposta_async
+from memoria.queries import buscar_documentos_referencia
 from schemas import (
     AnexoItem,
     ChatRequest,
     ChatResponse,
     ConversaDetalhe,
     ConversaResumo,
+    IndicadorDesenvolvimentoItem,
     MensagemItem,
+    MetaBimestreItem,
 )
 
 router = APIRouter(tags=["chat"])
 
-_CONVERSAS_SESSAO: dict[int, dict[str, dict[str, Any]]] = {}
-_ATIVIDADES_DOCX_MEMORIA: dict[str, tuple[int, str, bytes]] = {}
-_ATIVIDADES_PDF_MEMORIA: dict[str, tuple[int, str, bytes]] = {}
+# Estado efêmero com TTL (1h) e limite de itens para evitar crescimento ilimitado em RAM
+_PEDIDOS_ATIVIDADE_PENDENTES: BoundedTTLCache[tuple[int, int, str], dict[str, Any]] = BoundedTTLCache(ttl_seconds=1800, max_items=200)
+_ATIVIDADES_DOCX_MEMORIA: BoundedTTLCache[str, tuple[int, str, bytes]] = BoundedTTLCache(ttl_seconds=3600, max_items=100)
+_ATIVIDADES_PDF_MEMORIA: BoundedTTLCache[str, tuple[int, str, bytes]] = BoundedTTLCache(ttl_seconds=3600, max_items=100)
 
 _TERMOS_PEDIDO_ATIVIDADE = (
     "criar uma atividade",
@@ -75,20 +78,18 @@ def _detectar_pedido_atividade_conversa(texto: str) -> bool:
     return any(termo in t for termo in _TERMOS_PEDIDO_ATIVIDADE)
 
 
-def obter_historico_sessao_aluno(id_aluno: int, limite: int = 20) -> str:
-    convs = _CONVERSAS_SESSAO.get(id_aluno, {})
-    msgs: list[dict[str, Any]] = []
-    for c in convs.values():
-        msgs.extend(c.get("mensagens", []))
-    msgs.sort(key=lambda x: x.get("data", ""))
-    linhas = []
-    for m in msgs[-limite:]:
-        remetente = "Professor" if m.get("role") == "user" else "Assistente"
-        conteudo = m.get("conteudo", "")
-        if remetente == "Assistente" and len(conteudo) > 300:
-            conteudo = conteudo[:300] + "..."
-        linhas.append(f"{remetente}: {conteudo}")
-    return "\n".join(linhas)
+def _exigir_pei_valido_aluno(aluno) -> None:
+    """Garante que o aluno possui PEI concluído e dentro da validade bimestral (60 dias) antes do chat."""
+    if not aluno.pei_ativo:
+        if aluno.pei_feito:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="A validade bimestral (60 dias) do PEI deste aluno expirou. Renove o PEI antes de conversar no chat.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="É obrigatório concluir o PEI deste aluno antes de conversar com a IA.",
+        )
 
 
 @router.post("/alunos/{id_aluno}/chat", response_model=ChatResponse)
@@ -98,30 +99,24 @@ async def post_chat(
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> ChatResponse:
     validar_permissao_chat_usuario(usuario_autenticado)
-    id_prof_token = int(
-        usuario_autenticado.get("id_prof")
-        or usuario_autenticado.get("sub")
-        or payload.id_prof
-        or 1
-    )
+    id_prof_raw = usuario_autenticado.get("id_prof")
+    if id_prof_raw is None:
+        id_prof_raw = usuario_autenticado["sub"]
+    id_prof_token = int(id_prof_raw)
+    token_jwt = usuario_autenticado.get("_raw_token")
 
     try:
-        aluno = await obter_aluno(id_aluno, token=usuario_autenticado.get("_raw_token"))
-    except ResourceNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Aluno {id_aluno} não encontrado na base de dados.",
-        )
+        aluno = await obter_aluno(id_aluno, token=token_jwt)
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Erro de comunicação com a API-DB: {exc}",
-        )
+        levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado na base de dados.")
+
+    _exigir_pei_valido_aluno(aluno)
 
     cid = payload.conversa_id
     if cid in ("string", "", "null", "None"):
         cid = None
     conversa_id = cid or str(uuid.uuid4())
+    chave_pendente = (id_prof_token, id_aluno, conversa_id)
 
     anexos_recebidos = payload.anexos or []
     textos_anexos: list[str] = []
@@ -145,41 +140,28 @@ async def post_chat(
     if not mensagem_base and nomes_anexos:
         mensagem_base = f"Adapte a atividade do arquivo anexado ({', '.join(nomes_anexos)}) para este estudante."
 
-    convs_aluno = _CONVERSAS_SESSAO.setdefault(id_aluno, {})
-    conv_mem_pre = convs_aluno.get(conversa_id) or {}
-    pedido_pendente_pre = conv_mem_pre.get("pedido_atividade_pendente")
+    pedido_pendente = _PEDIDOS_ATIVIDADE_PENDENTES.get(chave_pendente)
     texto_para_validacao = mensagem_base
-    if textos_anexos or pedido_pendente_pre or payload.template_id or payload.modo_adaptacao:
+    if textos_anexos or pedido_pendente or payload.template_id or payload.modo_adaptacao:
         texto_para_validacao = f"{mensagem_base} (adaptação de atividade pedagógica para o aluno)"
 
     valido, _, erro_guardrail = validar_e_higienizar_entrada(texto_para_validacao)
     if not valido:
         return ChatResponse(resposta=erro_guardrail, conversa_id=conversa_id)
     msg_segura, _ = sanitizar_dados_sensiveis(mensagem_base)
+
     if payload.historico is not None:
         mensagens_anteriores = payload.historico
     elif cid:
-        conv_mem = convs_aluno.get(conversa_id)
-        if conv_mem:
-            if conv_mem.get("id_prof") != id_prof_token:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Esta conversa pertence a outro professor.",
-                )
-            mensagens_anteriores = list(conv_mem.get("mensagens", []))
-        else:
-            msgs_qualquer_prof = obter_mensagens_conversa(id_aluno=id_aluno, conversa_id=conversa_id)
-            msgs_deste_prof = obter_mensagens_conversa(
-                id_aluno=id_aluno, conversa_id=conversa_id, id_prof=id_prof_token
+        try:
+            mensagens_anteriores = await obter_mensagens_conversa_db(
+                id_aluno=id_aluno, conversa_id=conversa_id, token=token_jwt
             )
-            if msgs_qualquer_prof and not msgs_deste_prof:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="Esta conversa pertence a outro professor.",
-                )
-            mensagens_anteriores = msgs_deste_prof
+        except Exception as exc:
+            levantar_http_de_erro_db(exc, msg_nao_encontrado="Conversa não encontrada.")
     else:
         mensagens_anteriores = []
+
     historico_conversa = ""
     eh_conversa_em_andamento = bool(mensagens_anteriores)
 
@@ -191,31 +173,20 @@ async def post_chat(
             if remetente == "Assistente" and len(conteudo) > 400:
                 conteudo = conteudo[:400] + "..."
             linhas_historico.append(f"{remetente}: {conteudo}")
-        historico_conversa = "HISTÓRICO DA CONVERSA:\n" + "\n".join(linhas_historico) + "\n\n"
+        historico_conversa = "HISTÓRICO DESTA CONVERSA:\n" + "\n".join(linhas_historico) + "\n\n"
 
+    # Memória geral consolidada do aluno vinda exclusivamente de Aluno.perfil_ia na API-DB
     perfil_contexto = aluno.perfil_ia or aluno.desc_aluno or ""
-    blocos_contexto_aluno: list[str] = []
+    contexto_combinado = ""
     if perfil_contexto:
         perfil_contexto, _ = sanitizar_dados_sensiveis(perfil_contexto)
-        blocos_contexto_aluno.append(f"PERFIL E CONTEXTO DO ALUNO:\n{perfil_contexto}")
+        contexto_combinado = f"MEMÓRIA E PERFIL CONSOLIDADO DO ALUNO (PEI + CONVERSAS):\n{perfil_contexto}"
 
-    contexto_peis = obter_contexto_peis_aluno(id_aluno, limite_peis=2, max_chars_por_pei=2500)
-    if contexto_peis:
-        contexto_peis, _ = sanitizar_dados_sensiveis(contexto_peis)
-        blocos_contexto_aluno.append(
-            f"PEI(S) CRIADO(S) DO ALUNO (MEMÓRIA OFICIAL):\n{contexto_peis}"
-        )
-
-    memoria_relevante = buscar_contexto_aluno(id_aluno=id_aluno, query=msg_segura, n_results=3)
-    if memoria_relevante:
-        memoria_relevante, _ = sanitizar_dados_sensiveis(memoria_relevante)
-        blocos_contexto_aluno.append(
-            f"MEMÓRIA PEDAGÓGICA RECENTE DO ALUNO:\n{memoria_relevante[:1500]}"
-        )
-
-    contexto_combinado = "\n\n".join(blocos_contexto_aluno)
-
-    fontes_docs = buscar_documentos_referencia(query=msg_segura, n_results=2) if not eh_conversa_em_andamento else []
+    fontes_docs = (
+        buscar_documentos_referencia(query=msg_segura, n_results=2)
+        if not eh_conversa_em_andamento
+        else []
+    )
 
     if eh_conversa_em_andamento:
         instrucao_continuidade = (
@@ -228,14 +199,12 @@ async def post_chat(
     else:
         instrucao_continuidade = (
             "- Esta é a PRIMEIRA mensagem desta conversa.\n"
-            "- Dê uma breve saudação inicial calorosa e acolhedora ao professor e apresente propostas práticas, simples e criativas para a atividade do aluno."
+            "- Dê uma breve saudação inicial calorosa e acolhedora ao professor e apresente propostas práticas, simples e criativas para a atividade do aluno, aproveitando a memória consolidada do estudante."
         )
 
     nome_aluno_limpo, _ = sanitizar_dados_sensiveis(aluno.nome_aluno)
     desc_aluno_limpa, _ = sanitizar_dados_sensiveis(aluno.desc_aluno or "")
 
-    conv_mem_existente = convs_aluno.get(conversa_id) or {}
-    pedido_pendente = conv_mem_existente.get("pedido_atividade_pendente")
     opcoes_pendentes_ids = (
         [o["id"] for o in pedido_pendente.get("opcoes", [])]
         if isinstance(pedido_pendente, dict)
@@ -258,11 +227,10 @@ async def post_chat(
         )
     )
 
-    # Caso 1: Professor pediu uma atividade na conversa (sem arquivo) e ainda não escolheu o template
     if pediu_atividade_na_conversa:
         opcoes_recomendadas = recomendar_templates_para_perfil(
             neurodivergencia=aluno.neurodiv_aluno,
-            desc_aluno=desc_aluno_limpa,
+            desc_aluno=perfil_contexto or desc_aluno_limpa,
             limite=3,
         )
         linhas_opcoes = "\n".join(
@@ -276,29 +244,23 @@ async def post_chat(
             f"Qual dessas opções você acha melhor usarmos para esta atividade? "
             f"(Pode responder com o número da opção ou o nome do modelo!)"
         )
-        agora_iso = datetime.now(timezone.utc).isoformat()
-        titulo_resumo, _ = sanitizar_dados_sensiveis(msg_segura[:40])
-        conv_atual = convs_aluno.setdefault(
-            conversa_id,
-            {
-                "conversa_id": conversa_id,
-                "id_prof": id_prof_token,
-                "titulo": titulo_resumo,
-                "data": agora_iso,
-                "mensagens": [],
-            },
-        )
-        conv_atual["data"] = agora_iso
-        conv_atual["pedido_atividade_pendente"] = {
+        _PEDIDOS_ATIVIDADE_PENDENTES[chave_pendente] = {
             "tema": msg_segura,
             "opcoes": opcoes_recomendadas,
         }
-        conv_atual["mensagens"].extend(
-            [
-                {"role": "user", "conteudo": msg_segura, "data": agora_iso, "anexos": None},
-                {"role": "assistant", "conteudo": resposta_escolha, "data": agora_iso, "anexos": None},
-            ]
-        )
+        if not payload.persistido_pelo_gateway:
+            titulo_resumo, _ = sanitizar_dados_sensiveis(msg_segura[:40])
+            try:
+                await registrar_turno_conversa_db(
+                    id_aluno=id_aluno,
+                    conversa_id=conversa_id,
+                    mensagem_usuario=msg_segura,
+                    resposta_ia=resposta_escolha,
+                    titulo=titulo_resumo,
+                    token=token_jwt,
+                )
+            except Exception:
+                pass
         return ChatResponse(
             resposta=resposta_escolha,
             conversa_id=conversa_id,
@@ -326,8 +288,7 @@ async def post_chat(
     elif template_escolhido:
         modo_adaptacao_usado = "template"
         template_usado_id = template_escolhido["id"]
-        if conv_mem_existente and "pedido_atividade_pendente" in conv_mem_existente:
-            conv_mem_existente.pop("pedido_atividade_pendente", None)
+        _PEDIDOS_ATIVIDADE_PENDENTES.pop(chave_pendente, None)
         contexto_tema = (
             f"Tema solicitado anteriormente pelo professor: {tema_pendente}\n"
             if tema_pendente
@@ -354,7 +315,7 @@ async def post_chat(
         f"- Nome: {nome_aluno_limpo}\n"
         f"- Idade: {aluno.idade_aluno or 'Não informada'}\n"
         f"- Diagnóstico / Condição: {aluno.neurodiv_aluno}\n"
-        f"- Hiperfocos e Observações: {desc_aluno_limpa or 'Nenhuma'}\n\n"
+        f"- Hiperfocos e Observações Iniciais: {desc_aluno_limpa or 'Consulte o Perfil Consolidado'}\n\n"
         f"{bloco_instrucoes_prof}"
         f"{historico_conversa}"
         f"{bloco_arquivos_prompt}"
@@ -368,11 +329,16 @@ async def post_chat(
         f"6. Proponha ideias práticas e viáveis para a sala de aula real, com linguagem simples e acessível.\n"
         f"7. Evite tom burocrático ou juridicista: aplique a inclusão e acessibilidade naturalmente, sem ficar recitando leis ou decretos a todo momento.\n"
         f"8. Privacidade LGPD: Jamais armazene, solicite ou faça referência a documentos de identificação pessoal (CPF, RG, etc.).\n"
-        f"9. Memória e PEI do Aluno: Sempre consulte e respeite o(s) PEI(s) e a memória pedagógica do aluno fornecidos no contexto para responder com precisão sobre o que foi planejado para ele.\n"
+        f"9. Memória e PEI do Aluno: Sempre consulte e respeite o Perfil Consolidado (PEI + aprendizados de conversas anteriores) fornecido no contexto.\n"
         f"10. Veracidade de Recursos: JAMAIS invente títulos fictícios de vídeos do YouTube, livros, canais, autores ou links inexistentes; ao recomendar vídeos ou materiais, indique apenas o formato, a proposta pedagógica e termos de busca."
     )
 
-    pediu_documento_pei = msg_segura.strip().lower() in ("documento", "gerar documento", "baixar pei", "enviar documento")
+    pediu_documento_pei = msg_segura.strip().lower() in (
+        "documento",
+        "gerar documento",
+        "baixar pei",
+        "enviar documento",
+    )
     deve_gerar_arquivo_atividade = bool(
         anexos_recebidos
         or template_escolhido is not None
@@ -405,32 +371,26 @@ async def post_chat(
     formato_arquivo_gerado: str | None = None
 
     if pediu_documento_pei:
-        from api.routes.pei import _PEI_DOCX_MEMORIA, montar_docx_pei
+        from api.routes.pei import montar_docx_pei
 
-        peis_existentes = listar_peis_aluno(id_aluno)
+        peis_existentes = await listar_peis_aluno_db(id_aluno, token=token_jwt)
         docx_pei_bytes: bytes | None = None
         pei_id_alvo = str(uuid.uuid4())
         if peis_existentes:
             pei_id_alvo = peis_existentes[0]["pei_id"]
-            docx_pei_bytes = _PEI_DOCX_MEMORIA.get(pei_id_alvo)
-            if not docx_pei_bytes:
-                detalhe = obter_pei_por_id(id_aluno, pei_id_alvo)
-                texto_pei = (detalhe or {}).get("documento_gerado", "")
-                docx_pei_bytes = montar_docx_pei(
-                    nome_aluno=nome_aluno_limpo,
-                    respostas_gerais={1: texto_pei, 2: texto_pei, 3: texto_pei, 4: texto_pei},
+            try:
+                docx_pei_bytes, _ = await baixar_pei_docx_db(
+                    id_aluno, pei_id_alvo, token=token_jwt
                 )
-        else:
+            except Exception:
+                docx_pei_bytes = None
+
+        if not docx_pei_bytes:
+            resumo_mem = perfil_contexto or f"Planejamento curricular adaptado para {nome_aluno_limpo} ({aluno.neurodiv_aluno})."
             docx_pei_bytes = montar_docx_pei(
                 nome_aluno=nome_aluno_limpo,
-                respostas_gerais={
-                    1: f"Planejamento curricular adaptado para {nome_aluno_limpo} ({aluno.neurodiv_aluno}).",
-                    2: "Estratégias DUA, apoio visual, mediação individualizada e recursos de acessibilidade.",
-                    3: "Avaliação contínua, portfólio e observação sistematizada respeitando o ritmo do estudante.",
-                    4: "Atividades práticas, jogos educativos, vídeos curtos e materiais concretos.",
-                },
+                respostas_gerais={1: resumo_mem, 2: resumo_mem, 3: resumo_mem, 4: resumo_mem},
             )
-            _PEI_DOCX_MEMORIA[pei_id_alvo] = docx_pei_bytes
 
         nome_seguro = "".join(c if c.isalnum() else "_" for c in nome_aluno_limpo).strip("_") or f"aluno_{id_aluno}"
         arquivo_nome_gerado = f"PEI_{nome_seguro}_2026.docx"
@@ -449,7 +409,7 @@ async def post_chat(
             f"Você pode clicar no arquivo anexado nesta mensagem para baixar e editar o que desejar."
         )
     else:
-        resposta_ia = gerar_resposta(
+        resposta_ia = await gerar_resposta_async(
             prompt=prompt,
             contexto_rag=contexto_combinado,
             fontes_referencia=fontes_docs,
@@ -509,95 +469,59 @@ async def post_chat(
                 )
             )
 
-    agora_iso = datetime.now(timezone.utc).isoformat()
     if mensagens_anteriores:
         primeira_msg_user = next((m for m in mensagens_anteriores if m.get("role") == "user"), None)
         titulo_bruto = primeira_msg_user.get("conteudo") if primeira_msg_user else msg_segura
     else:
         titulo_bruto = msg_segura
-    titulo_resumo, _ = sanitizar_dados_sensiveis(titulo_bruto[:40])
+    titulo_resumo, _ = sanitizar_dados_sensiveis((titulo_bruto or "")[:40])
 
-    conv_atual = convs_aluno.setdefault(
-        conversa_id,
-        {
-            "conversa_id": conversa_id,
-            "id_prof": id_prof_token,
-            "titulo": titulo_resumo,
-            "data": agora_iso,
-            "mensagens": [],
-        },
-    )
-    conv_atual["data"] = agora_iso
-    conv_atual["mensagens"].extend(
-        [
-            {
-                "role": "user",
-                "conteudo": msg_segura,
-                "data": agora_iso,
-                "anexos": [a.model_dump() for a in anexos_recebidos] if anexos_recebidos else None,
-            },
-            {
-                "role": "assistant",
-                "conteudo": resposta_ia,
-                "data": agora_iso,
-                "anexos": [a.model_dump() for a in anexos_resposta] if anexos_resposta else None,
-            },
-        ]
+    if not payload.persistido_pelo_gateway:
+        try:
+            await registrar_turno_conversa_db(
+                id_aluno=id_aluno,
+                conversa_id=conversa_id,
+                mensagem_usuario=msg_segura,
+                resposta_ia=resposta_ia,
+                titulo=titulo_resumo,
+                anexos_usuario=[a.model_dump() for a in anexos_recebidos] if anexos_recebidos else None,
+                anexos_ia=[a.model_dump() for a in anexos_resposta] if anexos_resposta else None,
+                token=token_jwt,
+            )
+        except Exception:
+            pass
+
+    from api.routes.dashboard_aluno import (
+        deve_atualizar_memoria_conversa,
+        gerar_contexto_sintetizado_aluno,
     )
 
-    try:
-        id_turma = aluno.id_turma or 0
-        salvar_documento(
-            id_aluno=id_aluno,
-            id_turma=id_turma,
-            id_prof=id_prof_token,
-            tipo="chat_user",
-            conteudo=msg_segura,
-            conversa_id=conversa_id,
-            titulo=titulo_resumo,
-            data_iso=agora_iso,
+    perfil_atualizado: str | None = None
+    indicadores_gerados: list[IndicadorDesenvolvimentoItem] | None = None
+    metas_geradas: list[MetaBimestreItem] | None = None
+    if not pediu_documento_pei and deve_atualizar_memoria_conversa(
+        mensagem_usuario=msg_segura,
+        resposta_ia=resposta_ia,
+        gerou_atividade_adaptada=deve_gerar_arquivo_atividade,
+    ):
+        trecho_para_sintese = (
+            f"{historico_conversa}Professor: {msg_segura}\nAssistente: {resposta_ia[:600]}"
         )
-        salvar_documento(
-            id_aluno=id_aluno,
-            id_turma=id_turma,
-            id_prof=id_prof_token,
-            tipo="chat_ia",
-            conteudo=resposta_ia,
-            conversa_id=conversa_id,
-            titulo=titulo_resumo,
-            data_iso=agora_iso,
+        perfil_atualizado, _, inds_raw, metas_raw = await gerar_contexto_sintetizado_aluno(
+            aluno=aluno,
+            historico_conversas=trecho_para_sintese,
+            sincronizar_db=not payload.persistido_pelo_gateway,
+            token=token_jwt,
         )
-    except Exception:
-        pass
-
-    if payload.total_interacoes is not None:
-        total_interacoes = payload.total_interacoes
-    else:
-        total_interacoes = sum(
-            1
-            for c in convs_aluno.values()
-            for m in c.get("mensagens", [])
-            if m.get("role") == "user"
-        )
-
-    from api.routes.dashboard_aluno import verificar_e_atualizar_contexto_aluno
-
-    historico_para_sintese = (
-        f"{historico_conversa}Professor: {msg_segura}\nAssistente: {resposta_ia[:300]}"
-        if payload.historico is not None
-        else obter_historico_sessao_aluno(id_aluno)
-    )
-    perfil_atualizado = await verificar_e_atualizar_contexto_aluno(
-        aluno=aluno,
-        historico_conversas=historico_para_sintese,
-        total_interacoes=total_interacoes,
-        token=usuario_autenticado.get("_raw_token"),
-    )
+        indicadores_gerados = [IndicadorDesenvolvimentoItem(**i) for i in inds_raw]
+        metas_geradas = [MetaBimestreItem(**m) for m in metas_raw]
 
     return ChatResponse(
         resposta=resposta_ia,
         conversa_id=conversa_id,
         perfil_atualizado=perfil_atualizado,
+        indicadores_desenvolvimento=indicadores_gerados,
+        metas_bimestre=metas_geradas,
         anexos=anexos_resposta or None,
         atividade_id=atividade_id_gerada,
         arquivo_nome=arquivo_nome_gerado,
@@ -693,18 +617,14 @@ async def get_conversas(
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> list[ConversaResumo]:
     validar_permissao_chat_usuario(usuario_autenticado)
-    id_prof_token = int(usuario_autenticado.get("id_prof") or usuario_autenticado.get("sub") or 1)
-    conversas = listar_conversas_aluno(id_aluno, id_prof=id_prof_token)
-    por_id = {c["conversa_id"]: c for c in conversas}
-    for cid, c_mem in _CONVERSAS_SESSAO.get(id_aluno, {}).items():
-        if c_mem.get("id_prof") == id_prof_token and cid not in por_id:
-            por_id[cid] = {
-                "conversa_id": cid,
-                "titulo": c_mem.get("titulo", ""),
-                "data": c_mem.get("data", ""),
-            }
-    lista = sorted(por_id.values(), key=lambda x: x.get("data", ""), reverse=True)
-    return [ConversaResumo(**c) for c in lista]
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        lista = await listar_conversas_aluno_db(
+            id_aluno, incluir_metricas=False, token=token_jwt
+        )
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado.")
+    return [ConversaResumo(**c) for c in (lista or [])]
 
 
 @router.get("/alunos/{id_aluno}/conversas/{conversa_id}", response_model=ConversaDetalhe)
@@ -714,16 +634,11 @@ async def get_mensagens_conversa_endpoint(
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> ConversaDetalhe:
     validar_permissao_chat_usuario(usuario_autenticado)
-    id_prof_token = int(usuario_autenticado.get("id_prof") or usuario_autenticado.get("sub") or 1)
-    conv_mem = _CONVERSAS_SESSAO.get(id_aluno, {}).get(conversa_id)
-    if conv_mem and conv_mem.get("id_prof") is not None and conv_mem.get("id_prof") != id_prof_token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Esta conversa pertence a outro professor.",
-        )
-    msgs = obter_mensagens_conversa(id_aluno, conversa_id, id_prof=id_prof_token)
-    if not msgs and conv_mem and conv_mem.get("id_prof") == id_prof_token:
-        msgs = list(conv_mem.get("mensagens", []))
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        msgs = await obter_mensagens_conversa_db(id_aluno, conversa_id, token=token_jwt)
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado="Conversa não encontrada.")
     return ConversaDetalhe(
         conversa_id=conversa_id,
         mensagens=[MensagemItem(**m) for m in msgs],
@@ -736,21 +651,12 @@ async def delete_conversa_endpoint(
     conversa_id: str,
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> dict[str, Any]:
-    """Remove uma conversa da sessão e do banco vetorial ChromaDB."""
+    """Remove uma conversa do professor no PostgreSQL via API-DB."""
     validar_permissao_chat_usuario(usuario_autenticado)
     id_prof_token = int(usuario_autenticado.get("id_prof") or usuario_autenticado.get("sub") or 1)
-    convs_aluno = _CONVERSAS_SESSAO.get(id_aluno, {})
-    conv_mem = convs_aluno.get(conversa_id)
-    if conv_mem and conv_mem.get("id_prof") is not None and conv_mem.get("id_prof") != id_prof_token:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Esta conversa pertence a outro professor.",
-        )
-    if conversa_id in convs_aluno:
-        del convs_aluno[conversa_id]
-    removidos = excluir_conversa_aluno(id_aluno, conversa_id, id_prof=id_prof_token)
-    return {
-        "mensagem": "Conversa removida com sucesso.",
-        "conversa_id": conversa_id,
-        "documentos_removidos": removidos,
-    }
+    _PEDIDOS_ATIVIDADE_PENDENTES.pop((id_prof_token, id_aluno, conversa_id), None)
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        return await excluir_conversa_aluno_db(id_aluno, conversa_id, token=token_jwt)
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado="Conversa não encontrada.")

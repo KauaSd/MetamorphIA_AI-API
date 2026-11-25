@@ -19,20 +19,21 @@ from arquivo_utils import (
     para_data_url_pdf,
 )
 from auth_jwt import verificar_token_jwt
+from cache_utils import BoundedTTLCache
 from guardrails import (
     MENSAGEM_ALERTA_DADOS_SENSIVEIS,
     detectar_prompt_injection,
     sanitizar_dados_sensiveis,
 )
-from llm_client import gerar_resposta
+from llm_client import gerar_resposta_async
 from memoria.queries import buscar_documentos_referencia
 from api.schemas.response import AlunoResponse
 from schemas import AnexoItem
 
 Queryrouter = APIRouter(prefix="/query", tags=["query"])
 
-_QUERY_ATIVIDADES_DOCX: dict[str, tuple[str, bytes]] = {}
-_QUERY_ATIVIDADES_PDF: dict[str, tuple[str, bytes]] = {}
+_QUERY_ATIVIDADES_DOCX: BoundedTTLCache[str, tuple[int, str, bytes]] = BoundedTTLCache(ttl_seconds=3600, max_items=100)
+_QUERY_ATIVIDADES_PDF: BoundedTTLCache[str, tuple[int, str, bytes]] = BoundedTTLCache(ttl_seconds=3600, max_items=100)
 
 
 class AdaptarAtividadeRequest(BaseModel):
@@ -172,7 +173,7 @@ ESTRUTURE SUA RESPOSTA EM:
 4. RECURSOS COMPLEMENTARES E ESTRATÉGIAS DE MEDIAÇÃO
 """
 
-    resposta_texto = gerar_resposta(
+    resposta_texto = await gerar_resposta_async(
         prompt=prompt,
         fontes_referencia=fontes,
         formato_referencias="discreto",
@@ -204,8 +205,12 @@ ESTRUTURE SUA RESPOSTA EM:
     nome_base = "".join(c if c.isalnum() else "_" for c in (titulo_doc or "Atividade")).strip("_")[:40] or "Atividade"
     nome_docx = f"Atividade_Adaptada_{nome_base}.docx"
     nome_pdf = f"Atividade_Adaptada_{nome_base}.pdf"
-    _QUERY_ATIVIDADES_DOCX[atividade_id] = (nome_docx, docx_bytes)
-    _QUERY_ATIVIDADES_PDF[atividade_id] = (nome_pdf, pdf_bytes)
+    id_prof_raw = _usuario_autenticado.get("id_prof")
+    if id_prof_raw is None:
+        id_prof_raw = _usuario_autenticado["sub"]
+    id_prof_token = int(id_prof_raw)
+    _QUERY_ATIVIDADES_DOCX[atividade_id] = (id_prof_token, nome_docx, docx_bytes)
+    _QUERY_ATIVIDADES_PDF[atividade_id] = (id_prof_token, nome_pdf, pdf_bytes)
     docx_b64 = base64.b64encode(docx_bytes).decode("ascii")
     pdf_b64 = base64.b64encode(pdf_bytes).decode("ascii")
 
@@ -271,7 +276,13 @@ async def baixar_query_atividade_docx(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Arquivo de atividade adaptada não encontrado.",
         )
-    nome_arq, docx_bytes = item
+    dono_id, nome_arq, docx_bytes = item
+    id_prof_token = int(_usuario_autenticado.get("id_prof") or _usuario_autenticado.get("sub") or 0)
+    if dono_id != id_prof_token and _usuario_autenticado.get("tipo_usuario") != "adm_sistema":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para baixar esta atividade.",
+        )
     return Response(
         content=docx_bytes,
         media_type=DOCX_MEDIA_TYPE,
@@ -294,7 +305,13 @@ async def baixar_query_atividade_pdf(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Arquivo PDF de atividade adaptada não encontrado.",
         )
-    nome_arq, pdf_bytes = item
+    dono_id, nome_arq, pdf_bytes = item
+    id_prof_token = int(_usuario_autenticado.get("id_prof") or _usuario_autenticado.get("sub") or 0)
+    if dono_id != id_prof_token and _usuario_autenticado.get("tipo_usuario") != "adm_sistema":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Você não tem permissão para baixar esta atividade.",
+        )
     return Response(
         content=pdf_bytes,
         media_type=PDF_MEDIA_TYPE,
@@ -318,7 +335,7 @@ async def perguntar_ia_post(
             f"INSTRUÇÕES PERSONALIZADAS DO PROFESSOR:\n{inst_limpa[:2000]}\n\n"
             f"Pergunta do Professor:\n{payload.pergunta}"
         )
-    resposta = gerar_resposta(prompt_pergunta, fontes_referencia=fontes, formato_referencias="discreto")
+    resposta = await gerar_resposta_async(prompt_pergunta, fontes_referencia=fontes, formato_referencias="discreto")
     return {"resposta": resposta}
 
 
@@ -328,7 +345,7 @@ async def enviaTxtIA(
     _usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> dict[str, str]:
     fontes = buscar_documentos_referencia(pergunta, n_results=2)
-    return {"resposta": gerar_resposta(pergunta, fontes_referencia=fontes)}
+    return {"resposta": await gerar_resposta_async(pergunta, fontes_referencia=fontes)}
 
 
 @Queryrouter.get("/Envia/{DescAl}", response_model=AlunoResponse)
@@ -361,7 +378,7 @@ Informações disponíveis:
 Exemplo de saída esperada:
 {{"nome":"João Silva","idade":10,"serie":"5º ano","neurodivergencia":"TDAH","diagnosticado":true,"descricao":"Aluno comunicativo..."}}
 """
-    result = gerar_resposta(prompt, aplicar_guardrails=False)
+    result = await gerar_resposta_async(prompt, aplicar_guardrails=False)
 
     match = re.search(r"\{.*\}", result, re.DOTALL)
     if match:

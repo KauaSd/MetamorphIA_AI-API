@@ -8,6 +8,7 @@ Estilo puramente funcional, sem classes desnecessárias.
 
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 import os
 from threading import Lock
@@ -287,6 +288,28 @@ def gerar_resposta(
     if aplicar_guardrails:
         return garantir_referencias_finais(resposta_bruta, fontes, formato=formato_referencias)
     return resposta_bruta
+
+
+async def gerar_resposta_async(
+    prompt: str,
+    contexto_rag: Optional[str] = None,
+    fontes_referencia: Optional[list[dict[str, Any]]] = None,
+    model: Optional[str] = None,
+    aplicar_guardrails: bool = True,
+    formato_referencias: str = "discreto",
+    system_prompt: Optional[str] = None,
+) -> str:
+    """Executa gerar_resposta em thread separada sem bloquear o event loop do FastAPI."""
+    return await asyncio.to_thread(
+        gerar_resposta,
+        prompt=prompt,
+        contexto_rag=contexto_rag,
+        fontes_referencia=fontes_referencia,
+        model=model,
+        aplicar_guardrails=aplicar_guardrails,
+        formato_referencias=formato_referencias,
+        system_prompt=system_prompt,
+    )
 
 
 def gerar_resposta_stream(

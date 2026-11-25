@@ -1,15 +1,14 @@
 """Configurações centralizadas da aplicação API-IA MetamorphIA.
 
-Carrega variáveis de ambiente via dotenv e define valores padrão seguros
-para conexão com a API-DB, banco vetorial ChromaDB, chaves dos modelos de LLM
-e autenticação JWT compartilhada com a API-DB.
+Carrega variáveis de ambiente via dotenv e exige SECRET_KEY forte para
+validação cruzada de JWT com a API-DB.
 """
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 from pathlib import Path
+import secrets
 from typing import Optional
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -17,25 +16,30 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 _BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(_BASE_DIR / ".env")
 
+_CHAVE_PADRAO_INSEGURA = "sua_chave_secreta_super_segura_metamorphia_2026"
+_CHAVE_EFEMERA_TESTE = secrets.token_hex(32)
+
 
 class Settings(BaseSettings):
     ENVIRONMENT: str = "development"
+    ENABLE_MOCK_ROUTES: bool = False
 
     # Conexão com a API do banco relacional
     DB_API_URL: str = "http://localhost:8000"
-    API_DB_AUTH_TOKEN: Optional[str] = None
 
-    # Autenticação JWT (mesma chave e algoritmo da api_db para validação cruzada)
-    SECRET_KEY: str = "sua_chave_secreta_super_segura_metamorphia_2026"
+    # Autenticação JWT (mesma chave, algoritmo, issuer e audience da api_db)
+    SECRET_KEY: str = ""
     ALGORITHM: str = "HS256"
+    JWT_ISSUER: str = "metamorphia-db-api"
+    JWT_AUDIENCE: str = "metamorphia-services"
 
     # Segurança: CORS e Rate Limiting
     CORS_ORIGINS: str = "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173"
     RATE_LIMIT_DEFAULT: str = "120/minute"
 
-    # Persistência do banco vetorial ChromaDB
+    # Persistência do banco vetorial ChromaDB (somente documentos de referência)
     CHROMA_PATH: str = str(_BASE_DIR / "data" / "chroma")
-    CHROMA_COLLECTION: str = "metamorphia_memoria"
+    CHROMA_COLLECTION: str = "metamorphia_documentos"
     CHROMA_COLLECTION_MEMORIA: str = "metamorphia_memoria"
     CHROMA_COLLECTION_DOCS: str = "metamorphia_documentos"
     RAW_DATA_PATH: str = str(_BASE_DIR / "data" / "raw")
@@ -50,6 +54,7 @@ class Settings(BaseSettings):
     GEMINI_MAX_RPD: int = 500
     AI_ALLOWED_EMAILS: str = ""
     SUPABASE_URL: str = ""
+    SUPABASE_ASSETS_KEY: str = ""
     SUPABASE_SERVICE_KEY: str = ""
     SUPABASE_BUCKET: str = "metamorphia-arquivos"
 
@@ -62,11 +67,18 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    """Retorna a instância singleton de configurações da aplicação."""
+    """Retorna a instância singleton de configurações da aplicação validando SECRET_KEY."""
     cfg = Settings()
-    if cfg.ENVIRONMENT.strip().lower() == "production" and (
-        cfg.SECRET_KEY == "sua_chave_secreta_super_segura_metamorphia_2026"
-        or len(cfg.SECRET_KEY.strip()) < 32
-    ):
-        raise RuntimeError("SECRET_KEY insegura ou padrão não permitida em produção.")
+    env_norm = cfg.ENVIRONMENT.strip().lower()
+    chave = (cfg.SECRET_KEY or "").strip()
+
+    if env_norm in ("test", "testing") and (not chave or chave == _CHAVE_PADRAO_INSEGURA):
+        cfg.SECRET_KEY = _CHAVE_EFEMERA_TESTE
+        return cfg
+
+    if not chave or chave == _CHAVE_PADRAO_INSEGURA or len(chave) < 32:
+        raise RuntimeError(
+            "SECRET_KEY ausente, padrão ou com menos de 32 caracteres. "
+            "Configure uma SECRET_KEY forte no ambiente."
+        )
     return cfg

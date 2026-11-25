@@ -13,38 +13,65 @@ from typing import Optional
 import xml.etree.ElementTree as ET
 import zipfile
 
+from fastapi import HTTPException, status
 from pypdf import PdfReader
 import textwrap
 
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PDF_MEDIA_TYPE = "application/pdf"
+MAX_ARQUIVO_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_DOCX_DESCOMPACTADO_BYTES = 25 * 1024 * 1024  # 25 MB (proteção contra Zip Bomb)
+MAX_B64_CHARS = 14_500_000
 
 
 def decodificar_base64_ou_data_url(conteudo: str) -> bytes:
-    """Decodifica uma string base64 pura ou no formato Data URL (data:...;base64,...)."""
+    """Decodifica uma string base64 pura ou Data URL aplicando limite estrito de tamanho (10 MB)."""
     if not conteudo:
         return b""
     limpo = conteudo.strip()
+    if len(limpo) > MAX_B64_CHARS:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="Arquivo enviado excede o limite máximo permitido de 10 MB.",
+        )
     if "," in limpo and limpo.lower().startswith("data:"):
         limpo = limpo.split(",", 1)[1].strip()
-    # Corrige padding se necessário
     faltando = len(limpo) % 4
     if faltando:
         limpo += "=" * (4 - faltando)
     try:
-        return base64.b64decode(limpo)
+        dados = base64.b64decode(limpo)
     except Exception:
         return b""
+    if len(dados) > MAX_ARQUIVO_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="Arquivo enviado excede o limite máximo permitido de 10 MB.",
+        )
+    return dados
 
 
 def extrair_texto_docx_bytes(conteudo_bytes: bytes) -> str:
-    """Extrai todo o texto dos parágrafos de um arquivo .docx em memória."""
+    """Extrai todo o texto dos parágrafos de um arquivo .docx com proteção contra Zip/XML Bomb."""
     w_ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     ns = {"w": w_ns}
     with zipfile.ZipFile(io.BytesIO(conteudo_bytes), "r") as zin:
+        infos = zin.infolist()
+        if len(infos) > 200 or sum(i.file_size for i in infos) > MAX_DOCX_DESCOMPACTADO_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                detail="Estrutura compactada do arquivo .docx excede os limites seguros.",
+            )
         if "word/document.xml" not in zin.namelist():
             return ""
         xml_bytes = zin.read("word/document.xml")
+
+    cabecalho_xml = xml_bytes[:4096].upper()
+    if b"<!ENTITY" in cabecalho_xml or b"<!DOCTYPE" in cabecalho_xml:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Arquivo XML/DOCX contém declarações de entidade não permitidas.",
+        )
 
     tree = ET.fromstring(xml_bytes)
     paragrafos: list[str] = []

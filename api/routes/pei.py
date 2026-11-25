@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import glob
@@ -15,21 +16,24 @@ import zipfile
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
-from auth_jwt import verificar_token_jwt
+from auth_jwt import validar_permissao_chat_usuario, verificar_token_jwt
 from config import get_settings
-from db_client import ResourceNotFoundError, atualizar_descricao_aluno, obter_aluno
+from db_client import (
+    atualizar_descricao_aluno,
+    atualizar_status_pei_disciplina_db,
+    baixar_pei_docx_db,
+    levantar_http_de_erro_db,
+    listar_peis_aluno_db,
+    obter_aluno,
+    obter_pei_detalhe_db,
+    salvar_pei_arquivo_db,
+)
 from guardrails import sanitizar_dados_sensiveis
 from llm_client import gerar_resposta
-from memoria.chroma_client import salvar_documento
-from memoria.queries import (
-    buscar_contexto_aluno,
-    buscar_documentos_referencia,
-    listar_peis_aluno,
-    obter_contexto_peis_aluno,
-    obter_pei_por_id,
-    obter_ultimo_perfil,
-)
+from memoria.queries import buscar_documentos_referencia
 from schemas import (
+    IndicadorDesenvolvimentoItem,
+    MetaBimestreItem,
     PeiCriarRequest,
     PeiCriarResponse,
     PeiDetalhe,
@@ -100,8 +104,6 @@ def _limpar_texto_resposta_pei(texto: str) -> str:
         ln = re.sub(r"^\s*[-*]\s+", "• ", ln)
         linhas_limpas.append(ln)
     return "\n".join(linhas_limpas).strip()
-
-_PEI_DOCX_MEMORIA: dict[str, bytes] = {}
 
 PERGUNTA_INICIAL_PRIMEIRO_PEI = (
     "Percebi que é o seu primeiro PEI, por isso ainda não conheço esse aluno, "
@@ -176,11 +178,10 @@ def _localizar_modelo_docx() -> Path:
 def _obter_contexto_consolidado_aluno(
     desc_aluno: Optional[str],
     perfil_ia: Optional[str],
-    ultimo_perfil_memoria: Optional[str],
     descricao_enviada: Optional[str] = None,
 ) -> str:
     partes = []
-    for texto in (descricao_enviada, perfil_ia, desc_aluno, ultimo_perfil_memoria):
+    for texto in (descricao_enviada, perfil_ia, desc_aluno):
         if texto and texto.strip() and texto.strip().lower() not in ("string", "none", "null"):
             limpo, _ = sanitizar_dados_sensiveis(texto.strip())
             if limpo and limpo not in partes:
@@ -864,52 +865,56 @@ async def criar_pei_inicial(
     payload: Optional[PeiInicialRequest] = None,
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> PeiInicialResponse:
-    """Inicia a elaboração do PEI com base no Roteiro MetamorphIA.docx.
+    """Inicia a elaboração do PEI com base no Roteiro MetamorphIA.
 
-    - Se o aluno ainda não tiver contexto (1º PEI) e nenhuma descrição for enviada no body,
-      retorna a pergunta pedindo ao professor que descreva o estudante em pelo menos 5 linhas.
-    - Se o aluno já tiver contexto (ou a descrição for enviada), retorna todas as perguntas e
-      subperguntas do roteiro com 4 possíveis respostas geradas para cada subpergunta.
+    - Apenas na 1ª vez do aluno (quando perfil_ia e desc_aluno estiverem vazios) e nenhuma descrição
+      tiver sido enviada no body, retorna a pergunta pedindo que o professor descreva o estudante.
+    - Nas vezes seguintes (quando o aluno já possui perfil_ia/desc_aluno) ou após o envio da descrição,
+      gera todas as subperguntas do roteiro com 4 alternativas de múltipla escolha cada.
     """
+    validar_permissao_chat_usuario(usuario_autenticado)
     req = payload or PeiInicialRequest()
     token_jwt = usuario_autenticado.get("_raw_token")
     try:
         aluno = await obter_aluno(id_aluno, token=token_jwt)
-    except ResourceNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Aluno {id_aluno} não encontrado na base de dados.",
-        )
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Erro de comunicação com a API-DB: {exc}",
-        )
+        levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado na base de dados.")
 
-    if req.descricao_aluno and req.descricao_aluno.strip():
-        desc_limpa, _ = sanitizar_dados_sensiveis(req.descricao_aluno.strip())
+    desc_bruta = (req.descricao_aluno or "").strip()
+    if desc_bruta.lower() in ("string", "none", "null"):
+        desc_bruta = ""
+
+    if desc_bruta:
+        desc_limpa, _ = sanitizar_dados_sensiveis(desc_bruta)
         try:
-            await atualizar_descricao_aluno(id_aluno, desc_limpa, token=token_jwt)
+            await atualizar_descricao_aluno(id_aluno, desc_aluno=desc_limpa, token=token_jwt)
         except Exception:
             pass
     else:
         desc_limpa = None
 
-    ultimo_perfil = obter_ultimo_perfil(id_aluno)
-    contexto_peis_anteriores = obter_contexto_peis_aluno(id_aluno, limite_peis=1, max_chars_por_pei=1500)
     contexto_aluno = _obter_contexto_consolidado_aluno(
         desc_aluno=aluno.desc_aluno,
         perfil_ia=aluno.perfil_ia,
-        ultimo_perfil_memoria=ultimo_perfil,
         descricao_enviada=desc_limpa,
     )
-    if contexto_peis_anteriores:
-        contexto_aluno = f"{contexto_aluno}\n\nPEI ANTERIOR DO ALUNO:\n{contexto_peis_anteriores}".strip()
+
+    if req.componente_curricular:
+        try:
+            await atualizar_status_pei_disciplina_db(
+                id_aluno=id_aluno,
+                disciplina=req.componente_curricular,
+                status_pei="em_andamento",
+                token=token_jwt,
+            )
+        except Exception:
+            pass
 
     nome_aluno_limpo, _ = sanitizar_dados_sensiveis(aluno.nome_aluno)
     neuro_limpa, _ = sanitizar_dados_sensiveis(aluno.neurodiv_aluno)
 
-    return gerar_roteiro_pei_inicial(
+    return await asyncio.to_thread(
+        gerar_roteiro_pei_inicial,
         id_aluno=id_aluno,
         nome_aluno=nome_aluno_limpo,
         neurodivergencia=neuro_limpa,
@@ -926,45 +931,20 @@ async def _processar_criacao_pei(
     payload: PeiCriarRequest,
     usuario_autenticado: dict[str, Any],
 ) -> tuple[PeiCriarResponse, bytes]:
+    from api.routes.dashboard_aluno import gerar_contexto_sintetizado_aluno
+
+    validar_permissao_chat_usuario(usuario_autenticado)
+    token_jwt = usuario_autenticado.get("_raw_token")
     try:
-        aluno = await obter_aluno(id_aluno, token=usuario_autenticado.get("_raw_token"))
-    except ResourceNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Aluno {id_aluno} não encontrado na base de dados.",
-        )
+        aluno = await obter_aluno(id_aluno, token=token_jwt)
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Erro de comunicação com a API-DB: {exc}",
-        )
+        levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado na base de dados.")
 
-    id_prof = payload.id_prof or usuario_autenticado.get("id_prof", 1)
-    id_turma = aluno.id_turma or 0
-
-    for item in payload.respostas:
-        perg_limpa, _ = sanitizar_dados_sensiveis(item.pergunta)
-        resp_limpa, _ = sanitizar_dados_sensiveis(item.resposta)
-        salvar_documento(
-            id_aluno=id_aluno,
-            id_turma=id_turma,
-            id_prof=id_prof,
-            tipo="pei_resposta",
-            conteudo=f"{perg_limpa} => {resp_limpa}",
-        )
-
-    ultimo_perfil = obter_ultimo_perfil(id_aluno)
-    contexto_historico = buscar_contexto_aluno(
-        id_aluno, "dificuldades aprendizagem objetivos adaptações PEI"
-    )
     contexto_aluno = _obter_contexto_consolidado_aluno(
         desc_aluno=aluno.desc_aluno,
         perfil_ia=aluno.perfil_ia,
-        ultimo_perfil_memoria=ultimo_perfil,
         descricao_enviada=payload.descricao_aluno,
     )
-    if contexto_historico:
-        contexto_aluno = f"{contexto_aluno}\n{contexto_historico}".strip()
 
     fontes_docs = buscar_documentos_referencia(
         query="diretrizes elaboração PEI adaptações curriculares acessibilidade AEE Decreto 12686 DUA",
@@ -982,7 +962,8 @@ async def _processar_criacao_pei(
     ano_escolar, _ = sanitizar_dados_sensiveis(payload.ano_escolar or "Ensino Fundamental")
     bimestre = payload.periodo_bimestre if payload.periodo_bimestre in (1, 2, 3, 4) else 1
 
-    respostas_gerais_int = gerar_respostas_gerais_pei(
+    respostas_gerais_int = await asyncio.to_thread(
+        gerar_respostas_gerais_pei,
         nome_aluno=nome_aluno_limpo,
         idade_aluno=aluno.idade_aluno,
         neurodivergencia=neuro_limpa,
@@ -1013,25 +994,43 @@ async def _processar_criacao_pei(
         periodo_bimestre=bimestre,
     )
 
-    pei_id = str(uuid.uuid4())
-    data_iso = datetime.now(timezone.utc).isoformat()
-    _PEI_DOCX_MEMORIA[pei_id] = docx_bytes
-
-    salvar_documento(
-        id_aluno=id_aluno,
-        id_turma=id_turma,
-        id_prof=id_prof,
-        tipo="pei_documento",
-        conteudo=documento_gerado,
-        id_doc=pei_id,
-        data_iso=data_iso,
-        titulo=f"PEI - {nome_aluno_limpo} - {data_iso[:10]}",
+    # Sintetiza imediatamente o perfil_ia consolidado do aluno a partir da descrição + PEI elaborado
+    if payload.descricao_aluno and not aluno.desc_aluno:
+        aluno.desc_aluno = sanitizar_dados_sensiveis(payload.descricao_aluno)[0]
+    perfil_sintetizado, _, indicadores_gerados, metas_geradas = await gerar_contexto_sintetizado_aluno(
+        aluno=aluno,
+        contexto_pei=documento_gerado,
+        sincronizar_db=False,
+        token=token_jwt,
     )
 
+    pei_id = str(uuid.uuid4())
+    data_iso = datetime.now(timezone.utc).isoformat()
     nome_arquivo_seguro = "".join(
         c if c.isalnum() or c in ("_", "-") else "_" for c in nome_aluno_limpo
     ).strip("_") or f"aluno_{id_aluno}"
     arquivo_nome = f"PEI_{nome_arquivo_seguro}_{bimestre}Bim_2026.docx"
+    docx_b64 = base64.b64encode(docx_bytes).decode("ascii")
+    pei_valido_ate: Optional[str] = None
+
+    if not payload.persistido_pelo_gateway:
+        try:
+            meta_db = await salvar_pei_arquivo_db(
+                id_aluno=id_aluno,
+                pei_id=pei_id,
+                arquivo_nome=arquivo_nome,
+                documento_docx_base64=docx_b64,
+                componente_curricular=componente,
+                perfil_ia=perfil_sintetizado,
+                desc_aluno=payload.descricao_aluno,
+                indicadores_desenvolvimento=indicadores_gerados,
+                metas_bimestre=metas_geradas,
+                validade_dias=60,
+                token=token_jwt,
+            )
+            pei_valido_ate = meta_db.get("pei_valido_ate")
+        except Exception as exc:
+            levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado.")
 
     resposta_obj = PeiCriarResponse(
         pei_id=pei_id,
@@ -1042,8 +1041,13 @@ async def _processar_criacao_pei(
         respostas_gerais={
             PERGUNTAS_GERAIS_MODELO[k]: v for k, v in respostas_gerais_int.items()
         },
-        documento_docx_base64=base64.b64encode(docx_bytes).decode("ascii"),
+        documento_docx_base64=docx_b64,
         download_url=f"/alunos/{id_aluno}/pei/{pei_id}/docx",
+        perfil_atualizado=perfil_sintetizado,
+        indicadores_desenvolvimento=[IndicadorDesenvolvimentoItem(**i) for i in indicadores_gerados],
+        metas_bimestre=[MetaBimestreItem(**m) for m in metas_geradas],
+        pei_feito=True,
+        pei_valido_ate=pei_valido_ate,
     )
     return resposta_obj, docx_bytes
 
@@ -1058,7 +1062,7 @@ async def criar_pei(
     ),
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ):
-    """Gera o PEI do aluno seguindo o modelo 2026 (.docx) e a lógica do Roteiro MetamorphIA."""
+    """Gera o PEI do aluno seguindo o modelo 2026 (.docx), salva no Supabase Storage e atualiza o perfil_ia."""
     resposta_obj, docx_bytes = await _processar_criacao_pei(
         id_aluno=id_aluno,
         payload=payload,
@@ -1082,7 +1086,7 @@ async def criar_pei_docx(
     payload: PeiCriarRequest,
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> Response:
-    """Gera e retorna diretamente o arquivo .docx do PEI no estilo do modelo 2026."""
+    """Gera, persiste no Supabase Storage + API-DB e retorna diretamente o arquivo .docx do PEI."""
     resposta_obj, docx_bytes = await _processar_criacao_pei(
         id_aluno=id_aluno,
         payload=payload,
@@ -1098,57 +1102,26 @@ async def criar_pei_docx(
     )
 
 
-async def _verificar_acesso_aluno_pei(id_aluno: int, usuario_autenticado: dict[str, Any]) -> None:
-    """Valida na API-DB que o aluno existe e que o usuário autenticado tem permissão de acesso (prevenção de BOLA/IDOR)."""
-    token_jwt = usuario_autenticado.get("_raw_token")
-    try:
-        await obter_aluno(id_aluno, token=token_jwt)
-    except ResourceNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Aluno {id_aluno} não encontrado na base de dados.",
-        )
-    except Exception as exc:
-        msg = str(exc)
-        if "HTTP 403" in msg:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Você não tem permissão para acessar os dados deste aluno.",
-            )
-        if "HTTP 401" in msg:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Credenciais inválidas para consulta na API-DB.",
-            )
-
-
 @router.get("/alunos/{id_aluno}/pei/{pei_id}/docx")
 async def baixar_pei_docx(
     id_aluno: int,
     pei_id: str,
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> Response:
-    """Baixa o arquivo .docx de um PEI já gerado."""
-    await _verificar_acesso_aluno_pei(id_aluno, usuario_autenticado)
-    docx_bytes = _PEI_DOCX_MEMORIA.get(pei_id)
-    if not docx_bytes:
-        pei = obter_pei_por_id(id_aluno, pei_id)
-        if not pei:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="PEI não encontrado para este aluno.",
-            )
-        texto = pei.get("documento_gerado", "")
-        docx_bytes = montar_docx_pei(
-            nome_aluno=f"Aluno {id_aluno}",
-            respostas_gerais={1: texto, 2: texto, 3: texto, 4: texto},
+    """Baixa o arquivo .docx de um PEI já gerado diretamente do Supabase Storage via API-DB (fail-closed)."""
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        docx_bytes, content_disp = await baixar_pei_docx_db(
+            id_aluno=id_aluno, pei_id=pei_id, token=token_jwt
         )
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado="PEI não encontrado para este aluno.")
 
     return Response(
         content=docx_bytes,
         media_type=DOCX_MEDIA_TYPE,
         headers={
-            "Content-Disposition": f'attachment; filename="PEI_aluno_{id_aluno}_{pei_id[:8]}.docx"',
+            "Content-Disposition": content_disp,
             "X-Pei-Id": pei_id,
         },
     )
@@ -1159,10 +1132,13 @@ async def get_peis_aluno(
     id_aluno: int,
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> list[PeiResumo]:
-    """Lista todos os PEIs registrados para o estudante."""
-    await _verificar_acesso_aluno_pei(id_aluno, usuario_autenticado)
-    peis = listar_peis_aluno(id_aluno)
-    return [PeiResumo(**p) for p in peis]
+    """Lista todos os PEIs registrados para o estudante via API-DB (fail-closed)."""
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        peis = await listar_peis_aluno_db(id_aluno=id_aluno, token=token_jwt)
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado na base de dados.")
+    return [PeiResumo(pei_id=p["pei_id"], data=p.get("data", ""), resumo=p.get("resumo", "")) for p in peis]
 
 
 @router.get("/alunos/{id_aluno}/pei/{pei_id}", response_model=PeiDetalhe)
@@ -1171,14 +1147,12 @@ async def get_pei_detalhe(
     pei_id: str,
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> PeiDetalhe:
-    """Busca o conteúdo na íntegra de um PEI específico."""
-    await _verificar_acesso_aluno_pei(id_aluno, usuario_autenticado)
-    pei = obter_pei_por_id(id_aluno, pei_id)
-    if not pei:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="PEI não encontrado para este aluno.",
-        )
+    """Busca o conteúdo de um PEI específico salvo no Supabase Storage via API-DB (fail-closed)."""
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        pei = await obter_pei_detalhe_db(id_aluno=id_aluno, pei_id=pei_id, token=token_jwt)
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado="PEI não encontrado para este aluno.")
     return PeiDetalhe(**pei)
 
 
@@ -1189,23 +1163,17 @@ async def importar_pei_arquivo(
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> PeiCriarResponse:
     """Importa um arquivo de PEI existente (.pdf, .docx, .txt), extrai seu conteúdo,
-    atualiza o contexto do aluno e registra o PEI estruturado para download e uso no chat.
+    sintetiza o perfil_ia, envia o .docx ao Supabase Storage e ativa a validade de 60 dias.
     """
+    from api.routes.dashboard_aluno import gerar_contexto_sintetizado_aluno
     from arquivo_utils import decodificar_base64_ou_data_url, extrair_texto_arquivo
 
+    validar_permissao_chat_usuario(usuario_autenticado)
     token_jwt = usuario_autenticado.get("_raw_token")
     try:
         aluno = await obter_aluno(id_aluno, token=token_jwt)
-    except ResourceNotFoundError:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Aluno {id_aluno} não encontrado na base de dados.",
-        )
     except Exception as exc:
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"Erro de comunicação com a API-DB: {exc}",
-        )
+        levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado na base de dados.")
 
     raw_bytes = decodificar_base64_ou_data_url(payload.arquivo_base64)
     if not raw_bytes:
@@ -1217,48 +1185,54 @@ async def importar_pei_arquivo(
     texto_extraido = extrair_texto_arquivo(payload.arquivo_nome, raw_bytes)
     texto_limpo, _ = sanitizar_dados_sensiveis(texto_extraido or f"PEI importado: {payload.arquivo_nome}")
 
-    try:
-        await atualizar_descricao_aluno(id_aluno, texto_limpo[:4500], token=token_jwt)
-    except Exception:
-        pass
-
     nome_aluno_limpo, _ = sanitizar_dados_sensiveis(aluno.nome_aluno)
     componente = payload.componente_curricular or "Língua Portuguesa"
     bimestre = payload.periodo_bimestre if payload.periodo_bimestre in (1, 2, 3, 4) else 1
 
-    if payload.arquivo_nome.lower().endswith(".docx"):
-        docx_bytes = raw_bytes
-    else:
-        docx_bytes = montar_docx_pei(
-            nome_aluno=nome_aluno_limpo,
-            respostas_gerais={
-                1: texto_limpo[:1500] or "Conteúdo importado do documento original.",
-                2: "Estratégias e recursos importados do PEI do estudante.",
-                3: "Avaliação processual e contínua conforme PEI importado.",
-                4: "Recursos complementares conforme documento importado.",
-            },
-            componente_curricular=componente,
-            periodo_bimestre=bimestre,
-        )
+    # Sempre reconstrói um pacote OpenXML limpo e sanitizado em vez de hospedar bytes brutos enviados pelo usuário
+    docx_bytes = montar_docx_pei(
+        nome_aluno=nome_aluno_limpo,
+        respostas_gerais={
+            1: texto_limpo[:1500] or "Conteúdo importado do documento original.",
+            2: "Estratégias e recursos importados do PEI do estudante.",
+            3: "Avaliação processual e contínua conforme PEI importado.",
+            4: "Recursos complementares conforme documento importado.",
+        },
+        componente_curricular=componente,
+        periodo_bimestre=bimestre,
+    )
+
+    perfil_sintetizado, _, indicadores_gerados, metas_geradas = await gerar_contexto_sintetizado_aluno(
+        aluno=aluno,
+        contexto_pei=texto_limpo[:4500],
+        sincronizar_db=False,
+        token=token_jwt,
+    )
 
     pei_id = str(uuid.uuid4())
     data_iso = datetime.now(timezone.utc).isoformat()
-    _PEI_DOCX_MEMORIA[pei_id] = docx_bytes
-
-    id_prof = int(payload.id_prof or usuario_autenticado.get("id_prof") or 1)
-    salvar_documento(
-        id_aluno=id_aluno,
-        id_turma=aluno.id_turma or 0,
-        id_prof=id_prof,
-        tipo="pei_documento",
-        conteudo=texto_limpo,
-        id_doc=pei_id,
-        data_iso=data_iso,
-        titulo=f"PEI Importado - {nome_aluno_limpo} - {data_iso[:10]}",
-    )
-
     nome_seguro = "".join(c if c.isalnum() else "_" for c in nome_aluno_limpo).strip("_") or f"aluno_{id_aluno}"
     arquivo_nome = f"PEI_{nome_seguro}_{bimestre}Bim_2026.docx"
+    docx_b64 = base64.b64encode(docx_bytes).decode("ascii")
+    pei_valido_ate: Optional[str] = None
+
+    if not payload.persistido_pelo_gateway:
+        try:
+            meta_db = await salvar_pei_arquivo_db(
+                id_aluno=id_aluno,
+                pei_id=pei_id,
+                arquivo_nome=arquivo_nome,
+                documento_docx_base64=docx_b64,
+                componente_curricular=componente,
+                perfil_ia=perfil_sintetizado,
+                indicadores_desenvolvimento=indicadores_gerados,
+                metas_bimestre=metas_geradas,
+                validade_dias=60,
+                token=token_jwt,
+            )
+            pei_valido_ate = meta_db.get("pei_valido_ate")
+        except Exception as exc:
+            levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado.")
 
     return PeiCriarResponse(
         pei_id=pei_id,
@@ -1269,6 +1243,11 @@ async def importar_pei_arquivo(
         respostas_gerais={
             PERGUNTAS_GERAIS_MODELO[1]: texto_limpo,
         },
-        documento_docx_base64=base64.b64encode(docx_bytes).decode("ascii"),
+        documento_docx_base64=docx_b64,
         download_url=f"/alunos/{id_aluno}/pei/{pei_id}/docx",
+        perfil_atualizado=perfil_sintetizado,
+        indicadores_desenvolvimento=[IndicadorDesenvolvimentoItem(**i) for i in indicadores_gerados],
+        metas_bimestre=[MetaBimestreItem(**m) for m in metas_geradas],
+        pei_feito=True,
+        pei_valido_ate=pei_valido_ate,
     )

@@ -14,6 +14,7 @@ from api.routes.pei import (
     gerar_roteiro_pei_inicial,
     montar_docx_pei,
 )
+from cache_utils import BoundedTTLCache
 from config import get_settings
 from guardrails import sanitizar_dados_sensiveis, validar_e_higienizar_entrada
 from llm_client import gerar_resposta, gerar_resposta_stream
@@ -24,12 +25,13 @@ _AMBIENTES_PERMITIDOS_MOCK = {"development", "dev", "test", "testing", "homologa
 
 
 def _verificar_ambiente_mock_permitido() -> None:
-    """Garante que as rotas /mock/* respondam 404 caso o ambiente seja alterado para produção."""
-    env = get_settings().ENVIRONMENT.strip().lower()
-    if env not in _AMBIENTES_PERMITIDOS_MOCK:
+    """Garante que as rotas /mock/* só fiquem ativas fora de produção e com ENABLE_MOCK_ROUTES=true."""
+    cfg = get_settings()
+    env = cfg.ENVIRONMENT.strip().lower()
+    if env not in _AMBIENTES_PERMITIDOS_MOCK or not cfg.ENABLE_MOCK_ROUTES:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Rota de desenvolvimento/homologação indisponível em ambiente de produção.",
+            detail="Rota de simulação desabilitada neste ambiente.",
         )
 
 
@@ -285,8 +287,8 @@ async def simular_neurodivergencias_e_perguntas(payload: SimularChatRequest) -> 
     )
 
 
-# Armazena em memória o contexto informado no /mock/pei/inicial para reaproveitar nos testes seguintes
-_CONTEXTO_MOCK_SESSAO: dict[int, str] = {}
+# Armazena em memória com TTL o contexto informado no /mock/pei/inicial
+_CONTEXTO_MOCK_SESSAO: BoundedTTLCache[int, str] = BoundedTTLCache(ttl_seconds=1800, max_items=50)
 
 
 class MockPeiInicialRequest(BaseModel):

@@ -28,7 +28,13 @@ services:
         sync: false
       - key: SUPABASE_URL
         sync: false
+      - key: SUPABASE_ASSETS_KEY
+        sync: false
       - key: SUPABASE_SERVICE_KEY
         sync: false
       - key: SUPABASE_BUCKET
         value: metamorphia-arquivos
+      - key: RATE_LIMIT_DEFAULT
+        value: 120/minute
+      - key: ENABLE_MOCK_ROUTES
+        value: "false"
