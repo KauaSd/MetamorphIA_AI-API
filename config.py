@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     GEMINI_MAX_RPM: int = 15
     GEMINI_MAX_RPD: int = 500
     AI_ALLOWED_EMAILS: str = ""
+    JWT_SESSION_CACHE_TTL_SECONDS: int = 120
     SUPABASE_URL: str = ""
     SUPABASE_ASSETS_KEY: str = ""
     SUPABASE_SERVICE_KEY: str = ""

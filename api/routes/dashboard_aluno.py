@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 import json
 import re
@@ -24,6 +25,7 @@ from memoria.queries import buscar_documentos_referencia
 from schemas import (
     AlunoDB,
     AlunoDashboardResponse,
+    AlunoDescricaoBreveResponse,
     ConversaResumo,
     DisciplinaItem,
     IndicadorDesenvolvimentoItem,
@@ -237,6 +239,102 @@ def deve_atualizar_memoria_conversa(
     return True
 
 
+def _limpar_markdown_perfil(texto: str) -> str:
+    """Remove marcações Markdown (negrito, títulos, separadores) do perfil do aluno."""
+    if not texto:
+        return ""
+    linhas: list[str] = []
+    for ln in str(texto).splitlines():
+        s = ln.strip()
+        if not s:
+            if linhas and linhas[-1] != "":
+                linhas.append("")
+            continue
+        if re.fullmatch(r"[-*_]{3,}", s):
+            continue
+        s = re.sub(r"^#{1,6}\s+", "", s)
+        s = re.sub(r"\*\*(.*?)\*\*", r"\1", s)
+        s = re.sub(r"__(.*?)__", r"\1", s)
+        s = re.sub(r"(?<!\*)\*(?!\s)([^*\n]+?)(?<!\s)\*(?!\*)", r"\1", s)
+        s = re.sub(r"^\s*[-*]\s+", "• ", s)
+        linhas.append(s)
+    return "\n".join(linhas).strip()
+
+
+def _montar_descricao_breve(
+    nome_aluno: str,
+    diagnostico: str,
+    perfil_ia: Optional[str],
+    desc_aluno: Optional[str],
+) -> str:
+    """Extrai uma descrição breve (1-2 frases, até ~220 caracteres) para o card Perfil do Aluno."""
+    bruto = _limpar_markdown_perfil((perfil_ia or desc_aluno or "").strip())
+    if not bruto:
+        return f"{nome_aluno} possui perfil {diagnostico} e está em acompanhamento pedagógico inclusivo."
+    linhas = []
+    for ln in bruto.splitlines():
+        limpa = re.sub(
+            r"^\s*\d+\.\s*(?:Neurodiverg[eê]ncia[^:]*|Estrat[eé]gias[^:]*|Pontos\s+Fortes[^:]*|O\s+que\s+Faz[^:]*|Hist[oó]rico[^:]*)\s*:\s*",
+            "",
+            ln.strip(),
+            flags=re.I,
+        ).strip()
+        if limpa:
+            linhas.append(limpa)
+    texto = " ".join(linhas) if linhas else bruto
+    texto = re.sub(r"\s+", " ", texto).strip()
+    if len(texto) <= 220:
+        return texto
+    corte = texto[:217]
+    ultimo_ponto = max(corte.rfind("."), corte.rfind("!"), corte.rfind("?"))
+    if ultimo_ponto >= 60:
+        return corte[: ultimo_ponto + 1].strip()
+    ultimo_espaco = corte.rfind(" ")
+    if ultimo_espaco >= 60:
+        return corte[:ultimo_espaco].rstrip(",;:") + "..."
+    return corte + "..."
+
+
+@router.get("/alunos/{id_aluno}/descricao-breve", response_model=AlunoDescricaoBreveResponse)
+async def get_aluno_descricao_breve(
+    id_aluno: int,
+    usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
+) -> AlunoDescricaoBreveResponse:
+    """Retorna uma descrição breve do aluno para exibição no card Perfil do Aluno."""
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        aluno = await obter_aluno(id_aluno, token=token_jwt)
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado.")
+
+    nome_turma = "Sem turma atribuída"
+    if aluno.id_turma:
+        try:
+            turma = await obter_turma(aluno.id_turma, token=token_jwt)
+            nome_turma = turma.nome_turma or f"Turma {aluno.id_turma}"
+        except Exception:
+            nome_turma = f"Turma {aluno.id_turma}"
+
+    diagnostico_limpo, _ = classificar_diagnostico(aluno.neurodiv_aluno)
+    tipo_usuario = usuario_autenticado.get("tipo_usuario", "normal")
+    pode_chat = usuario_autenticado.get("pode_chat", False)
+    if (tipo_usuario == "adm_institucional" or pode_chat is not True) and tipo_usuario != "adm_sistema":
+        desc_breve = f"{aluno.nome_aluno} possui perfil {diagnostico_limpo}."
+    else:
+        desc_breve = _montar_descricao_breve(
+            aluno.nome_aluno, diagnostico_limpo, aluno.perfil_ia, aluno.desc_aluno
+        )
+
+    return AlunoDescricaoBreveResponse(
+        id_aluno=aluno.id_aluno,
+        nome=aluno.nome_aluno,
+        idade=aluno.idade_aluno,
+        neurodivergencia=diagnostico_limpo,
+        turma=nome_turma,
+        descricao_breve=desc_breve,
+    )
+
+
 @router.get("/alunos/{id_aluno}/dashboard", response_model=AlunoDashboardResponse)
 async def get_aluno_dashboard(
     id_aluno: int,
@@ -257,7 +355,8 @@ async def get_aluno_dashboard(
             nome_turma = f"Turma {aluno.id_turma}"
 
     diagnostico_limpo, status_diag = classificar_diagnostico(aluno.neurodiv_aluno)
-    perfil_ia = aluno.perfil_ia or aluno.desc_aluno
+    perfil_bruto = aluno.perfil_ia or aluno.desc_aluno
+    perfil_ia = _limpar_markdown_perfil(perfil_bruto) if perfil_bruto else None
     pei_gerado = bool(aluno.pei_ativo)
 
     conversas: list[dict[str, Any]] = []
@@ -331,12 +430,18 @@ async def get_aluno_dashboard(
 
     ultimo_envio_str: Optional[str] = None
     proximo_periodo_str: Optional[str] = None
+    prazo_expirado = bool(aluno.pei_feito and not pei_gerado)
     if datas_concluidos:
         ultimo_dt = max(datas_concluidos)
         ultimo_envio_str = ultimo_dt.strftime("%d/%m/%y")
     if aluno.pei_valido_ate:
         try:
             dt_val = datetime.fromisoformat(aluno.pei_valido_ate.replace("Z", "+00:00"))
+            if dt_val.tzinfo is None:
+                from datetime import timezone as _tz
+                dt_val = dt_val.replace(tzinfo=_tz.utc)
+            if dt_val <= datetime.now(dt_val.tzinfo):
+                prazo_expirado = True
             if not ultimo_envio_str and aluno.pei_feito:
                 ultimo_envio_str = (dt_val - timedelta(days=60)).strftime("%d/%m/%y")
             fim_janela = dt_val + timedelta(days=11)
@@ -344,10 +449,16 @@ async def get_aluno_dashboard(
         except Exception:
             pass
 
+    atrasado = prazo_expirado and (total_disc == 0 or concluidos_disc < total_disc)
+    if atrasado and status_geral != "CONCLUIDO":
+        status_geral = "ATRASADO"
+
     peis_por_disciplina = PeisPorDisciplinaResumo(
         status_geral=status_geral,
         concluidos=concluidos_disc,
         total=total_disc,
+        atrasado=atrasado,
+        prazo_expirado=prazo_expirado,
         ultimo_envio=ultimo_envio_str,
         proximo_periodo=proximo_periodo_str,
         disciplinas=disciplinas_items,
@@ -364,6 +475,11 @@ async def get_aluno_dashboard(
         diagnostico=diagnostico_limpo,
         status_diagnostico=status_diag,
         perfil_ia=perfil_ia,
+        descricao_breve=_montar_descricao_breve(
+            aluno.nome_aluno, diagnostico_limpo, perfil_ia, aluno.desc_aluno
+        )
+        if perfil_ia is not None
+        else None,
         pei_gerado=pei_gerado,
         atividades_adaptadas=atividades_adaptadas,
         engajamento_percent=engajamento_percent,
@@ -436,9 +552,9 @@ def _normalizar_metas(
         return saida[:5]
     if pei_gerado:
         return [
-            MetaBimestreItem(id="m1", titulo="Consolidar rotina visual nas atividades", status="em_progresso"),
+            MetaBimestreItem(id="m1", titulo="Consolidar rotina visual nas atividades", status="a_iniciar"),
             MetaBimestreItem(id="m2", titulo="Ampliar autonomia em tarefas curtas", status="a_iniciar"),
-            MetaBimestreItem(id="m3", titulo=f"Participar das adaptações ({neurodivergencia or 'DUA'})", status="em_progresso"),
+            MetaBimestreItem(id="m3", titulo=f"Participar das adaptações ({neurodivergencia or 'DUA'})", status="a_iniciar"),
         ]
     return []
 
@@ -472,21 +588,22 @@ def _avaliar_indicadores_e_metas_deterministico(
         niveis["engajamento"] = 2
 
     indicadores = [{**base, "nivel": niveis[base["id"]]} for base in _INDICADORES_BASE]
+    sem_conversas = not (historico_conversas or "").strip()
     metas = [
         {
             "id": "m1",
             "titulo": "Manter foco em atividades divididas em blocos curtos",
-            "status": "atingida" if niveis["foco"] >= 4 else "em_progresso",
+            "status": "a_iniciar" if sem_conversas else ("atingida" if niveis["foco"] >= 4 else "em_progresso"),
         },
         {
             "id": "m2",
             "titulo": "Realizar tarefas com apoio visual e pistas graduais",
-            "status": "em_progresso" if niveis["autonomia"] >= 3 else "a_iniciar",
+            "status": "a_iniciar" if sem_conversas else ("em_progresso" if niveis["autonomia"] >= 3 else "a_iniciar"),
         },
         {
             "id": "m3",
             "titulo": "Engajar nas propostas adaptadas com regulação emocional",
-            "status": "atingida" if niveis["engajamento"] >= 4 and niveis["regulacao"] >= 4 else "em_progresso",
+            "status": "a_iniciar" if sem_conversas else ("atingida" if niveis["engajamento"] >= 4 and niveis["regulacao"] >= 4 else "em_progresso"),
         },
     ]
     return indicadores, metas
@@ -505,6 +622,12 @@ async def _gerar_indicadores_e_metas_ia(
             perfil_texto, historico_conversas, contexto_pei
         )
 
+    sem_conversas = not (historico_conversas or "").strip()
+    regra_status_metas = (
+        '- Como ainda não há conversas de acompanhamento, "status" de TODAS as metas deve ser obrigatoriamente "a_iniciar".'
+        if sem_conversas
+        else '- "status" das metas deve ser exatamente "em_progresso", "a_iniciar" ou "atingida".'
+    )
     prompt = f"""Com base exclusivamente na memória consolidada do aluno, no PEI e nas conversas recentes com o professor, avalie os 4 indicadores de desenvolvimento e as 3 metas do bimestre.
 Responda APENAS com um JSON válido, sem markdown e sem explicações extras, no formato exato:
 {{
@@ -515,14 +638,14 @@ Responda APENAS com um JSON válido, sem markdown e sem explicações extras, no
     {{"id": "engajamento", "nivel": 4}}
   ],
   "metas_bimestre": [
-    {{"id": "m1", "titulo": "Título curto da meta 1", "status": "em_progresso"}},
+    {{"id": "m1", "titulo": "Título curto da meta 1", "status": "a_iniciar"}},
     {{"id": "m2", "titulo": "Título curto da meta 2", "status": "a_iniciar"}},
-    {{"id": "m3", "titulo": "Título curto da meta 3", "status": "atingida"}}
+    {{"id": "m3", "titulo": "Título curto da meta 3", "status": "a_iniciar"}}
   ]
 }}
 Regras:
 - "nivel" deve ser inteiro de 1 a 5 (1=muito baixo/precisa de muito apoio, 3=intermediário/com pistas, 5=alto/autônomo).
-- "status" das metas deve ser exatamente "em_progresso", "a_iniciar" ou "atingida".
+{regra_status_metas}
 - Neurodivergência: {aluno.neurodiv_aluno}
 - Memória consolidada (Perfil IA):
 {perfil_texto[:2500]}
@@ -548,6 +671,9 @@ Regras:
                 dados.get("metas_bimestre"), aluno.neurodiv_aluno, True
             )
         ]
+        if sem_conversas:
+            for m in metas:
+                m["status"] = "a_iniciar"
         if inds and metas:
             return inds, metas
     except Exception:
@@ -569,7 +695,8 @@ async def gerar_contexto_sintetizado_aluno(
     from guardrails import sanitizar_dados_sensiveis
 
     id_aluno = aluno.id_aluno
-    fontes = buscar_documentos_referencia(
+    fontes = await asyncio.to_thread(
+        buscar_documentos_referencia,
         "perfil pedagógico neurodivergência potencialidades barreiras adaptação",
         n_results=2,
     )
@@ -596,6 +723,8 @@ Estruture o texto abordando tudo o que for relevante para que a IA lembre em fut
 2. Estratégias do PEI e O que Precisa de Adaptação (barreiras, gatilhos de distração/sobrecarga e recursos que funcionam)
 3. O que Faz Rápido, Facilidades e Pontos Fortes
 4. Histórico de Respostas, Feedbacks Práticos de Sala de Aula e Evolução Observada
+
+REGRAS DE FORMATAÇÃO: Escreva em texto puro, sem Markdown (NÃO use **negrito**, *itálico*, ### títulos ou --- separadores). Use apenas parágrafos simples ou tópicos com '• '.
 """
 
     perfil_texto = await gerar_resposta_async(
@@ -603,6 +732,7 @@ Estruture o texto abordando tudo o que for relevante para que a IA lembre em fut
         fontes_referencia=fontes,
         aplicar_guardrails=False,
     )
+    perfil_texto = _limpar_markdown_perfil(perfil_texto)
     perfil_texto, _ = sanitizar_dados_sensiveis(perfil_texto)
 
     indicadores, metas = await _gerar_indicadores_e_metas_ia(

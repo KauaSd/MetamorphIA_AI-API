@@ -26,6 +26,7 @@ from db_client import (
     listar_peis_aluno_db,
     obter_aluno,
     obter_pei_detalhe_db,
+    obter_turma,
     salvar_pei_arquivo_db,
 )
 from guardrails import sanitizar_dados_sensiveis
@@ -197,12 +198,6 @@ def _opcoes_padrao_contextualizadas(
     ano_escolar: str,
     periodo_bimestre: int,
 ) -> tuple[str, dict[str, list[str]]]:
-    resumo_ctx = (
-        contexto_aluno[:140].rstrip(".")
-        if contexto_aluno
-        else f"perfil {neurodivergencia}"
-    )
-
     conteudo_previsto = (
         f"Currículo Paulista ({ano_escolar} - {periodo_bimestre}º Bimestre - {componente_curricular}): "
         f"desenvolvimento das habilidades estruturantes do bimestre em {componente_curricular}, "
@@ -212,7 +207,7 @@ def _opcoes_padrao_contextualizadas(
 
     opcoes_por_sub: dict[str, list[str]] = {
         "1.1": [
-            f"Habilidades consolidadas: {nome_aluno} compreende comandos curtos e realiza atividades apoiadas em recursos visuais e temas de seu interesse ({resumo_ctx}).",
+            f"Habilidades consolidadas: {nome_aluno} compreende comandos curtos e realiza atividades apoiadas em recursos visuais e materiais concretos ({neurodivergencia}).",
             f"Em desenvolvimento: participa das tarefas de {componente_curricular} quando fragmentadas em etapas menores, mantendo o foco por períodos curtos.",
             f"Com mediação: realiza registros escritos e atividades abstratas de {componente_curricular} com apoio individual e exemplos concretos.",
             f"Autonomia funcional: expressa compreensão oralmente ou por apontamento visual, necessitando de suporte apenas na organização sequencial da tarefa.",
@@ -301,13 +296,32 @@ def gerar_roteiro_pei_inicial(
 
     settings = get_settings()
     if settings.LLM_PROVIDER.lower() != "mock":
+        trechos_curriculo = buscar_documentos_referencia(
+            query=f"Currículo Paulista {componente_curricular} {ano_escolar} {periodo_bimestre}º bimestre habilidades",
+            n_results=2,
+        )
+        bloco_curriculo = "\n".join(
+            f"- [{t.get('titulo', 'Currículo Paulista')}]: {t.get('texto', '')[:700]}"
+            for t in trechos_curriculo
+            if t.get("texto")
+        )
+        secao_curriculo = (
+            f"\nTRECHOS DO CURRÍCULO PAULISTA RECUPERADOS PARA {ano_escolar} / {componente_curricular}:\n{bloco_curriculo}\n"
+            if bloco_curriculo
+            else ""
+        )
         prompt_opcoes = (
             f"Você está gerando as opções de resposta para o formulário inicial do PEI (Roteiro MetamorphIA).\n"
             f"Estudante: {nome_aluno} | Neurodivergência: {neurodivergencia}\n"
             f"Contexto do estudante (descrição feita pelo professor): {contexto_limpo}\n"
-            f"Componente Curricular: {componente_curricular} | Ano: {ano_escolar} | Bimestre: {periodo_bimestre}º\n\n"
-            f"Para cada subpergunta abaixo, gere EXATAMENTE 4 possíveis respostas curtas, práticas e personalizadas para o contexto deste estudante, "
-            f"seguindo os critérios em vermelho do Roteiro MetamorphIA:\n"
+            f"Componente Curricular: {componente_curricular} | Série/Ano: {ano_escolar} | Bimestre: {periodo_bimestre}º\n"
+            f"{secao_curriculo}\n"
+            f"Para cada subpergunta abaixo, gere EXATAMENTE 4 possíveis respostas curtas, práticas e ALTAMENTE PERSONALIZADAS para este estudante específico.\n"
+            f"REGRAS DE PERSONALIZAÇÃO OBRIGATÓRIAS:\n"
+            f"- Baseie TODAS as opções nos interesses, pontos fortes e dificuldades descritos no contexto do estudante, usando linguagem pedagógica profissional.\n"
+            f"- PROIBIDO copiar ou repetir literalmente frases ou palavras brutas escritas pelo professor na descrição inicial (nunca cole o texto do professor entre parênteses).\n"
+            f"- PROIBIDO gerar frases genéricas de livro didático que serviriam para qualquer aluno.\n"
+            f"- Siga os critérios em vermelho do Roteiro MetamorphIA:\n"
             f"- '1.1': Subpergunta 'O que o estudante já consegue fazer?' (Critérios: habilidades já consolidadas; o que ainda está em desenvolvimento; o que o estudante só realiza com ajuda).\n"
             f"- '1.2': Subpergunta 'O que precisa e é possível de ser ajustado esse bimestre?' (Critérios: simplifica ações, aumenta o tempo de trabalho, divide a habilidade em pequenas etapas, usa recursos acessíveis sem retirar o conteúdo curricular).\n"
             f"- '1.3': Subpergunta 'E como isso será feito?' (Critérios: recursos de acessibilidade, uso de tecnologias assistivas, apoio de profissionais quando houver, adaptações de materiais e linguagem).\n"
@@ -859,6 +873,28 @@ def montar_docx_pei(
     return buffer.getvalue()
 
 
+async def _resolver_ano_escolar_turma(
+    aluno: Any,
+    ano_informado: Optional[str],
+    token: Optional[str],
+) -> str:
+    ano_limpo = (ano_informado or "").strip()
+    if ano_limpo and ano_limpo.lower() not in ("ensino fundamental", "string", "none", "null"):
+        return ano_limpo
+    if getattr(aluno, "id_turma", None):
+        try:
+            turma = await obter_turma(int(aluno.id_turma), token=token)
+            serie = (getattr(turma, "serie_ano", None) or "").strip()
+            if serie:
+                return serie
+            nome_t = (getattr(turma, "nome_turma", None) or "").strip()
+            if nome_t:
+                return nome_t
+        except Exception:
+            pass
+    return ano_limpo or "Ensino Fundamental"
+
+
 @router.post("/alunos/{id_aluno}/pei/inicial", response_model=PeiInicialResponse)
 async def criar_pei_inicial(
     id_aluno: int,
@@ -912,6 +948,7 @@ async def criar_pei_inicial(
 
     nome_aluno_limpo, _ = sanitizar_dados_sensiveis(aluno.nome_aluno)
     neuro_limpa, _ = sanitizar_dados_sensiveis(aluno.neurodiv_aluno)
+    ano_escolar_efetivo = await _resolver_ano_escolar_turma(aluno, req.ano_escolar, token_jwt)
 
     return await asyncio.to_thread(
         gerar_roteiro_pei_inicial,
@@ -920,7 +957,7 @@ async def criar_pei_inicial(
         neurodivergencia=neuro_limpa,
         contexto_aluno=contexto_aluno,
         componente_curricular=req.componente_curricular or "Língua Portuguesa",
-        ano_escolar=req.ano_escolar or "Ensino Fundamental",
+        ano_escolar=ano_escolar_efetivo,
         periodo_bimestre=req.periodo_bimestre or 1,
         indice_subpergunta=req.indice_subpergunta,
     )
@@ -946,8 +983,14 @@ async def _processar_criacao_pei(
         descricao_enviada=payload.descricao_aluno,
     )
 
-    fontes_docs = buscar_documentos_referencia(
-        query="diretrizes elaboração PEI adaptações curriculares acessibilidade AEE Decreto 12686 DUA",
+    componente, _ = sanitizar_dados_sensiveis(payload.componente_curricular or "Língua Portuguesa")
+    ano_escolar_efetivo = await _resolver_ano_escolar_turma(aluno, payload.ano_escolar, token_jwt)
+    ano_escolar, _ = sanitizar_dados_sensiveis(ano_escolar_efetivo)
+    bimestre = payload.periodo_bimestre if payload.periodo_bimestre in (1, 2, 3, 4) else 1
+
+    fontes_docs = await asyncio.to_thread(
+        buscar_documentos_referencia,
+        query=f"Currículo Paulista {componente} {ano_escolar} {bimestre}º bimestre habilidades PEI adaptações curriculares DUA",
         n_results=3,
     )
     textos_rag = "\n\n".join(f"[{f['titulo']}]: {f['texto']}" for f in fontes_docs)
@@ -958,9 +1001,6 @@ async def _processar_criacao_pei(
         payload.nome_professor_regente or usuario_autenticado.get("nome_prof", "") or ""
     )
     prof_esp, _ = sanitizar_dados_sensiveis(payload.nome_professor_especializado or "")
-    componente, _ = sanitizar_dados_sensiveis(payload.componente_curricular or "Língua Portuguesa")
-    ano_escolar, _ = sanitizar_dados_sensiveis(payload.ano_escolar or "Ensino Fundamental")
-    bimestre = payload.periodo_bimestre if payload.periodo_bimestre in (1, 2, 3, 4) else 1
 
     respostas_gerais_int = await asyncio.to_thread(
         gerar_respostas_gerais_pei,

@@ -149,6 +149,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
 )
 
 
@@ -172,8 +173,20 @@ app.include_router(query_router)
 
 
 @app.get("/health", tags=["health"])
-async def health() -> Response:
-    """Endpoint de verificação de integridade com checagem real da API-DB e ChromaDB."""
+def health() -> Response:
+    """Endpoint leve de liveness sem roundtrip ao banco/ChromaDB."""
+    import json
+
+    return Response(
+        content=json.dumps({"status": "ok", "service": "api-ia"}),
+        media_type="application/json",
+        status_code=200,
+    )
+
+
+@app.get("/health/deep", tags=["health"])
+async def health_deep() -> Response:
+    """Endpoint de verificação profunda com checagem real da API-DB e ChromaDB."""
     import json
 
     cfg = get_settings()
@@ -182,7 +195,7 @@ async def health() -> Response:
 
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            resp = await client.get(f"{cfg.DB_API_URL.rstrip('/')}/health")
+            resp = await client.get(f"{cfg.DB_API_URL.rstrip('/')}/health/deep")
             if resp.is_success:
                 db_status = "ok"
     except Exception:

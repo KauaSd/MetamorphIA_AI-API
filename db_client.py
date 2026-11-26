@@ -6,13 +6,32 @@ perfil_ia e arquivos de PEI (Supabase Storage via API-DB) em modo fail-closed.
 
 from __future__ import annotations
 
-from typing import Any, NoReturn, Optional
+from contextlib import asynccontextmanager
+from typing import Any, AsyncIterator, NoReturn, Optional
 from urllib.parse import quote
 from fastapi import HTTPException, status
 import httpx
 
 from config import get_settings
 from schemas import AlunoDB, TurmaDB
+
+_SHARED_HTTP_CLIENT: Optional[httpx.AsyncClient] = None
+
+
+@asynccontextmanager
+async def obter_cliente_http(timeout: float = 10.0) -> AsyncIterator[httpx.AsyncClient]:
+    """Reutiliza pool HTTP/keep-alive fora de testes e respeita monkeypatch em pytest."""
+    global _SHARED_HTTP_CLIENT
+    if httpx.AsyncClient.__name__ != "AsyncClient":
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            yield client
+        return
+    if _SHARED_HTTP_CLIENT is None or _SHARED_HTTP_CLIENT.is_closed:
+        _SHARED_HTTP_CLIENT = httpx.AsyncClient(
+            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            timeout=30.0,
+        )
+    yield _SHARED_HTTP_CLIENT
 
 
 class DBClientError(Exception):
@@ -110,9 +129,9 @@ async def obter_aluno(
     url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}"
     headers = _montar_headers(token)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.get(url, headers=headers)
+            resposta = await client.get(url, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao buscar aluno {id_aluno}") from exc
 
@@ -130,9 +149,9 @@ async def obter_turma(
     url = f"{_obter_base_url(base_url)}/turma/{int(id_turma)}"
     headers = _montar_headers(token)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.get(url, headers=headers)
+            resposta = await client.get(url, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao buscar turma {id_turma}") from exc
 
@@ -288,9 +307,9 @@ async def listar_peis_aluno_db(
     """Lista os PEIs salvos no Supabase Storage / banco para o aluno."""
     url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/pei-arquivos"
     headers = _montar_headers(token)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.get(url, headers=headers)
+            resposta = await client.get(url, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao listar PEIs do aluno {id_aluno}") from exc
 
@@ -310,9 +329,9 @@ async def obter_pei_detalhe_db(
     pei_seguro = quote(str(pei_id).strip(), safe="")
     url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/pei-arquivos/{pei_seguro}"
     headers = _montar_headers(token)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.get(url, headers=headers)
+            resposta = await client.get(url, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao buscar PEI {pei_id}") from exc
 
@@ -331,9 +350,9 @@ async def baixar_pei_docx_db(
     pei_seguro = quote(str(pei_id).strip(), safe="")
     url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/pei-arquivos/{pei_seguro}/docx"
     headers = _montar_headers(token)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.get(url, headers=headers)
+            resposta = await client.get(url, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao baixar .docx do PEI {pei_id}") from exc
 
@@ -343,6 +362,27 @@ async def baixar_pei_docx_db(
         f'attachment; filename="PEI_aluno_{int(id_aluno)}.docx"',
     )
     return resposta.content, disp
+
+
+async def listar_conversas_lote_db(
+    aluno_ids: Optional[str] = None,
+    token: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> dict[str, list[dict[str, Any]]]:
+    """Lista conversas de múltiplos alunos em lote no PostgreSQL."""
+    url = f"{_obter_base_url(base_url)}/Alunos/conversas-lote"
+    headers = _montar_headers(token)
+    params = {"aluno_ids": aluno_ids} if aluno_ids else None
+    async with obter_cliente_http(timeout) as client:
+        try:
+            resposta = await client.get(url, params=params, headers=headers, timeout=timeout)
+        except httpx.RequestError as exc:
+            raise DBClientError("Falha de conexão ao listar conversas em lote") from exc
+
+    _verificar_status_resposta(resposta, "Conversas em lote")
+    dados = resposta.json()
+    return dados if isinstance(dados, dict) else {}
 
 
 async def listar_conversas_aluno_db(
@@ -355,10 +395,9 @@ async def listar_conversas_aluno_db(
     """Lista conversas (e opcionalmente métricas pedagógicas) do aluno no PostgreSQL."""
     url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/conversas-db"
     headers = _montar_headers(token)
-    params = {"incluir_metricas": "true"} if incluir_metricas else None
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.get(url, params=params, headers=headers)
+            resposta = await client.get(url, params={"incluir_metricas": "true"} if incluir_metricas else None, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao listar conversas do aluno {id_aluno}") from exc
 
@@ -377,9 +416,9 @@ async def obter_mensagens_conversa_db(
     cid_seguro = quote(str(conversa_id).strip(), safe="")
     url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/conversas-db/{cid_seguro}"
     headers = _montar_headers(token)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.get(url, headers=headers)
+            resposta = await client.get(url, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao buscar conversa {conversa_id}") from exc
 

@@ -46,6 +46,9 @@ class AlunoDB(BaseModel):
 class TurmaDB(BaseModel):
     id_turma: int
     nome_turma: Optional[str] = None
+    serie_ano: Optional[str] = None
+    letra: Optional[str] = None
+    horario: Optional[str] = None
     id_prof: Optional[int] = Field(
         default=None, validation_alias=AliasChoices("id_prof", "fk_Usuario_id_usuario")
     )
@@ -127,6 +130,8 @@ class PeisPorDisciplinaResumo(BaseModel):
     status_geral: str
     concluidos: int
     total: int
+    atrasado: bool = False
+    prazo_expirado: bool = False
     ultimo_envio: Optional[str] = None
     proximo_periodo: Optional[str] = None
     disciplinas: List[PeiDisciplinaItem] = Field(default_factory=list)
@@ -148,6 +153,15 @@ class IndicadorDesenvolvimentoItem(BaseModel):
     cor: Literal["warning", "accent", "info", "success"]
 
 
+class AlunoDescricaoBreveResponse(BaseModel):
+    id_aluno: int
+    nome: str
+    idade: Optional[int] = None
+    neurodivergencia: str
+    turma: str
+    descricao_breve: str
+
+
 class AlunoDashboardResponse(BaseModel):
     id_aluno: int
     nome: str
@@ -156,6 +170,7 @@ class AlunoDashboardResponse(BaseModel):
     diagnostico: str
     status_diagnostico: StatusDiagnostico
     perfil_ia: Optional[str] = None
+    descricao_breve: Optional[str] = None
     pei_gerado: bool
     atividades_adaptadas: int
     engajamento_percent: int

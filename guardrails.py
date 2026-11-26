@@ -148,17 +148,35 @@ def detectar_prompt_injection(texto: str) -> tuple[bool, str]:
     return False, ""
 
 
+_PADRAO_SAUDACAO_OU_CONVERSACIONAL = re.compile(
+    r"^(?:"
+    r"o+i+|ol[aá]+|e\s*a[ií]|eae|opa|ei+|hey|hello|hi|"
+    r"bom\s+dia|boa\s+tarde|boa\s+noite|"
+    r"tudo\s+(?:bem|bom|certo)\??|"
+    r"obrigad[oa]|valeu|vlw|ok(?:ay)?|certo|beleza|entendi|perfeito|"
+    r"sim|n[aã]o|pode\s+ser|vamos|ajuda|me\s+ajuda|socorro|como\s+funciona\??|"
+    r"(?:gerar\s+|enviar\s+|baixar\s+)?documento|baixar\s+pei|"
+    r"(?:op[cç][aã]o\s*)?[1-4]"
+    r")[\s!.,?]*$",
+    re.IGNORECASE,
+)
+
+
 def validar_escopo_pedagogico(texto: str) -> tuple[bool, str]:
     if not texto or not texto.strip():
         return False, "Por favor, digite sua pergunta pedagógica ou solicitação de adaptação."
 
-    texto_lower = texto.lower()
+    texto_limpo = texto.strip()
+    texto_lower = texto_limpo.lower()
 
     if any(termo in texto_lower for termo in PALAVRAS_CHAVE_ESCOPO):
         return True, ""
 
-    saudacoes_comuns = {"olá", "ola", "bom dia", "boa tarde", "boa noite", "ajuda", "socorro", "como funciona"}
-    if any(s == texto_lower.strip() for s in saudacoes_comuns):
+    if _PADRAO_SAUDACAO_OU_CONVERSACIONAL.match(texto_limpo):
+        return True, ""
+
+    # Aceita saudações combinadas (ex: "oii, tudo bem?", "bom dia! pode me ajudar?")
+    if re.match(r"^(?:o+i+|ol[aá]+|bom\s+dia|boa\s+tarde|boa\s+noite|e\s*a[ií]|eae)\b", texto_lower):
         return True, ""
 
     return False, MENSAGEM_RECUSA_ESCOPO

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 from typing import Annotated, Any
 
 from fastapi import Depends, HTTPException, status
@@ -9,9 +10,14 @@ import httpx
 import jwt
 from jwt.exceptions import InvalidTokenError
 
+from cache_utils import BoundedTTLCache
 from config import get_settings
+from db_client import obter_cliente_http
 
 security_bearer = HTTPBearer(auto_error=True)
+_CACHE_SESSAO_DB: BoundedTTLCache[str, dict[str, Any]] = BoundedTTLCache(
+    ttl_seconds=120, max_items=512
+)
 
 
 def decodificar_token_jwt(token: str) -> dict[str, Any]:
@@ -33,13 +39,22 @@ def decodificar_token_jwt(token: str) -> dict[str, Any]:
 
 
 async def _validar_sessao_api_db(token_raw: str) -> dict[str, Any]:
-    """Revalida na API-DB a existência do usuário, token_version (tv) e permissões atuais."""
+    """Revalida na API-DB o usuário ativo e permissões, com cache em memória por token (TTL configurável)."""
     settings = get_settings()
+    eh_teste = settings.ENVIRONMENT.strip().lower() in ("test", "testing")
+    ttl_cache = 0 if eh_teste else max(0, int(getattr(settings, "JWT_SESSION_CACHE_TTL_SECONDS", 120)))
+    chave_cache = hashlib.sha256(token_raw.encode("utf-8")).hexdigest()
+    if ttl_cache > 0:
+        _CACHE_SESSAO_DB.ttl_seconds = ttl_cache
+        em_cache = _CACHE_SESSAO_DB.get(chave_cache)
+        if em_cache is not None:
+            return em_cache
+
     url = f"{settings.DB_API_URL.rstrip('/')}/autenticar/me"
     headers = {"Authorization": f"Bearer {token_raw}"}
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with obter_cliente_http(10.0) as client:
         try:
-            resp = await client.get(url, headers=headers)
+            resp = await client.get(url, headers=headers, timeout=10.0)
         except httpx.RequestError as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -63,7 +78,10 @@ async def _validar_sessao_api_db(token_raw: str) -> dict[str, Any]:
             detail="Falha ao validar sessão na API-DB.",
         )
     dados = resp.json()
-    return dados if isinstance(dados, dict) else {}
+    resultado = dados if isinstance(dados, dict) else {}
+    if ttl_cache > 0 and resultado:
+        _CACHE_SESSAO_DB[chave_cache] = resultado
+    return resultado
 
 
 async def verificar_token_jwt(
