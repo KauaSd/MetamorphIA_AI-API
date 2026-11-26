@@ -162,6 +162,43 @@ _PADRAO_SAUDACAO_OU_CONVERSACIONAL = re.compile(
 )
 
 
+_PADROES_ESCOPO = [
+    re.compile(rf"(?<!\w){re.escape(termo)}(?!\w)", re.IGNORECASE)
+    for termo in PALAVRAS_CHAVE_ESCOPO
+]
+
+_TERMOS_PEDAGOGIA_INCLUSIVA = (
+    "adaptar", "adaptação", "adaptada", "adaptado",
+    "inclusão", "inclusivo", "inclusiva",
+    "neurodivergente", "neurodivergência", "neurodiversidade",
+    "tea", "autismo", "autista", "tdah", "dislexia", "discalculia",
+    "disgrafia", "dispraxia", "tod", "altas habilidades", "superdotação",
+    "pei", "aee", "dua", "desenho universal",
+)
+
+_PADROES_PEDAGOGIA_INCLUSIVA = [
+    re.compile(rf"(?<!\w){re.escape(termo)}(?!\w)", re.IGNORECASE)
+    for termo in _TERMOS_PEDAGOGIA_INCLUSIVA
+]
+
+_PADROES_FORA_ESCOPO_EXPLICITO = [
+    re.compile(r"\btrabalhos?\s+(?:escolar(?:es)?|da\s+escola)\b", re.IGNORECASE),
+    re.compile(r"\b(?:dever|li[çc][aã]o|tarefa)\s+de\s+casa\b", re.IGNORECASE),
+    re.compile(r"\b(?:meu|minha)\s+(?:trabalho|tarefa|prova|reda[çc][aã]o|li[çc][aã]o)\b", re.IGNORECASE),
+    re.compile(r"\bo\s+que\s+(?:est[aá]|t[aá]|ta)\s+errado\b", re.IGNORECASE),
+    re.compile(r"\b(?:corrij[ao]|revise)\s+(?:esse|este|o)\s+texto\b", re.IGNORECASE),
+    re.compile(r"\bfa[çc]a\s+(?:esse|este|o|meu)\s+trabalho\b", re.IGNORECASE),
+]
+
+
+def eh_pedido_explicitamente_fora_escopo(texto: str) -> bool:
+    if not texto:
+        return False
+    if any(p.search(texto) for p in _PADROES_PEDAGOGIA_INCLUSIVA):
+        return False
+    return any(p.search(texto) for p in _PADROES_FORA_ESCOPO_EXPLICITO)
+
+
 def validar_escopo_pedagogico(texto: str) -> tuple[bool, str]:
     if not texto or not texto.strip():
         return False, "Por favor, digite sua pergunta pedagógica ou solicitação de adaptação."
@@ -169,7 +206,10 @@ def validar_escopo_pedagogico(texto: str) -> tuple[bool, str]:
     texto_limpo = texto.strip()
     texto_lower = texto_limpo.lower()
 
-    if any(termo in texto_lower for termo in PALAVRAS_CHAVE_ESCOPO):
+    if eh_pedido_explicitamente_fora_escopo(texto_limpo):
+        return False, MENSAGEM_RECUSA_ESCOPO
+
+    if any(p.search(texto_lower) for p in _PADROES_ESCOPO):
         return True, ""
 
     if _PADRAO_SAUDACAO_OU_CONVERSACIONAL.match(texto_limpo):

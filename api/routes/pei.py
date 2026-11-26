@@ -64,7 +64,11 @@ PROMPT_SISTEMA_PEI = (
     "tópicos simples iniciados por '• '.\n"
     "6. NUNCA invente títulos fictícios de vídeos do YouTube, canais, livros, autores, jogos comerciais ou links/URLs; "
     "indique apenas formatos/tipos de recursos pedagógicos, critérios de acessibilidade e termos de busca.\n"
-    "7. Privacidade LGPD: jamais inclua CPF, RG, telefone ou documentos civis."
+    "7. Privacidade LGPD: jamais inclua CPF, RG, telefone ou documentos civis.\n"
+    "8. Coesão e foco nas respostas do professor: use as respostas enviadas pelo professor como eixo central do PEI, "
+    "integrando-as de forma coesa. Você pode complementar com estratégias ou orientações pedagógicas que NÃO foram "
+    "mencionadas explicitamente, desde que sejam diretamente alinhadas e centralizadas no que o professor pediu e "
+    "escolheu — sem fugir do direcionamento dele nem despejar opções genéricas desconexas."
 )
 
 
@@ -553,43 +557,39 @@ def gerar_respostas_gerais_pei(
         for r in respostas_subperguntas
     )
 
-    dados_p1 = "\n".join(agrupadas[1]) or todos_dados_brutos or "Sem subperguntas específicas informadas."
-    dados_p2 = "\n".join(agrupadas[2]) or todos_dados_brutos or "Sem subperguntas específicas informadas."
-    dados_p3 = "\n".join(agrupadas[3]) or todos_dados_brutos or "Sem subperguntas específicas informadas."
-    dados_p4 = "\n".join(agrupadas[4]) or todos_dados_brutos or "Sem subperguntas específicas informadas."
+    dados_p1 = "\n".join(agrupadas[1]) or "Nenhuma resposta específica informada pelo professor para esta seção."
+    dados_p2 = "\n".join(agrupadas[2]) or "Nenhuma resposta específica informada pelo professor para esta seção."
+    dados_p3 = "\n".join(agrupadas[3]) or "Nenhuma resposta específica informada pelo professor para esta seção."
+    dados_p4 = "\n".join(agrupadas[4]) or "Nenhuma resposta específica informada pelo professor para esta seção."
+
+    def _montar_fallback_secao(titulo: str, respostas_secao: list[str], complemento: str) -> str:
+        if respostas_secao:
+            itens = "\n".join(f"• {r.lstrip('- ').strip()}" for r in respostas_secao)
+            return f"{titulo}\n{itens}"
+        if todos_dados_brutos:
+            return f"{titulo}\n• {complemento}"
+        return f"{titulo}\n• A definir com base no acompanhamento pedagógico do estudante."
 
     respostas_padrao: dict[int, str] = {
-        1: (
-            f"Conteúdos e Habilidades do Currículo Paulista ({ano_escolar} - {periodo_bimestre}º Bimestre - {componente_curricular}):\n"
-            f"Serão trabalhadas as habilidades estruturantes previstas no Currículo da Rede Estadual Paulista para a turma regular em {componente_curricular}, "
-            f"assegurando o acesso de {nome_aluno} ({neurodivergencia}) ao conteúdo curricular sem redução de expectativas.\n"
-            f"• Habilidades consolidadas, em desenvolvimento e com mediação (dados levantados): {dados_p1.replace(chr(10), ' | ')}\n"
-            f"• Adaptações necessárias no bimestre: simplificação de comandos e ações, ampliação do tempo de realização e divisão das habilidades em pequenas etapas sequenciais.\n"
-            f"• Recursos e apoios previstos: uso de recursos de acessibilidade, materiais adaptados com suporte visual, tecnologias assistivas e articulação contínua com o professor especializado do Atendimento Educacional Especializado (AEE)."
+        1: _montar_fallback_secao(
+            f"Conteúdos e Habilidades do Currículo Paulista ({ano_escolar} - {periodo_bimestre}º Bimestre - {componente_curricular}) para {nome_aluno} ({neurodivergencia}):",
+            agrupadas[1],
+            "Planejamento alinhado às respostas gerais informadas pelo professor.",
         ),
-        2: (
-            f"Fundamentado nos princípios do Desenho Universal para a Aprendizagem (DUA - múltiplos meios de engajamento, representação e ação/expressão) "
-            f"e na articulação entre sala comum, AEE e gestão escolar:\n"
-            f"• Estratégias, Intervenções e Recursos selecionados para {nome_aluno}: {dados_p2.replace(chr(10), ' | ')}\n"
-            f"• Estratégias Pedagógicas: explicação do conteúdo em partes menores, uso de exemplos concretos do cotidiano, previsibilidade com rotina visual passo a passo, ampliação de tempo e mediação em atividades coletivas.\n"
-            f"• Intervenções Pedagógicas: apoio individualizado em tarefas complexas, adaptação de quantidade e complexidade mantendo o objetivo curricular e flexibilização da forma de participação (oral, pictograma, escrita ou digital).\n"
-            f"• Recursos de Acessibilidade: materiais com fonte acessível e destaque visual, esquemas/pictogramas, recursos digitais e controle de estímulos sensoriais."
+        2: _montar_fallback_secao(
+            f"Estratégias, intervenções pedagógicas e recursos de acessibilidade definidos pelo professor para {nome_aluno}:",
+            agrupadas[2],
+            "Ações pedagógicas definidas conforme as respostas informadas pelo professor.",
         ),
-        3: (
-            f"O acompanhamento da aprendizagem de {nome_aluno} será processual, contínuo e centrado em suas potencialidades, "
-            f"utilizando instrumentos diversificados e acessíveis:\n"
-            f"• Instrumentos definidos pelo professor: {dados_p3.replace(chr(10), ' | ')}\n"
-            f"• Aplicação Inclusiva: observação diária registrada pelo professor, portfólio com produções e atividades adaptadas, "
-            f"avaliações práticas e orais orientadas, lista de verificação (checklist) de habilidades, autoavaliação mediada com apoio visual e provas adaptadas com recursos de acessibilidade.\n"
-            f"• Princípio Básico de Avaliação: mensurar e valorizar o progresso individual de {nome_aluno} em relação a ele mesmo e ao seu ponto de partida no bimestre, orientando o replanejamento pedagógico."
+        3: _montar_fallback_secao(
+            f"Acompanhamento e avaliação inclusiva da aprendizagem de {nome_aluno}:",
+            agrupadas[3],
+            "Avaliação processual alinhada ao progresso individual do estudante e às respostas do professor.",
         ),
-        4: (
-            f"Recursos pedagógicos complementares e suplementares indicados para fortalecer o aprendizado de {nome_aluno} em {componente_curricular}:\n"
-            f"• Direcionamento a partir das subperguntas: {dados_p4.replace(chr(10), ' | ')}\n"
-            f"• Vídeos: animações curtas explicando o conteúdo do {periodo_bimestre}º bimestre, vídeos com linguagem simples, narração clara, exemplos visuais e passo a passo.\n"
-            f"• Livros: textos e histórias curtas ilustradas, livros de curiosidades sobre o tema da aula e materiais paradidáticos em formatos acessíveis/ampliados.\n"
-            f"• Jogos: jogos de memória temáticos, jogos de associação (imagem–palavra e causa–efeito), jogos digitais educativos, quebra-cabeças e jogos de turnos para interação social.\n"
-            f"• Atividades e Exercícios: sequências didáticas com etapas curtas, atividades manipulativas com materiais concretos, exercícios de completar/ligar/ordenar e propostas multissensoriais."
+        4: _montar_fallback_secao(
+            f"Recursos e atividades complementares indicados pelo professor para {nome_aluno} em {componente_curricular}:",
+            agrupadas[4],
+            "Recursos selecionados conforme as respostas informadas pelo professor.",
         ),
     }
 
@@ -600,26 +600,22 @@ def gerar_respostas_gerais_pei(
             f"Estudante: {nome_aluno} | Idade: {idade_aluno or 'Não informada'} | Neurodivergência: {neurodivergencia}\n"
             f"Componente Curricular: {componente_curricular} | Ano: {ano_escolar} | Bimestre: {periodo_bimestre}º\n"
             f"Contexto do Estudante: {contexto_aluno}\n\n"
-            f"REGRA OBRIGATÓRIA (ROTEIRO METAMORPHIA):\n"
-            f"- Gere a resposta APENAS para cada uma das 4 Perguntas Gerais (NÃO repita as subperguntas como perguntas no texto final e NÃO inclua textos explicativos azuis).\n"
-            f"- Considere todas as respostas das subperguntas como dados para construir a resposta de cada Pergunta Geral, seguindo rigorosamente o norteamento em vermelho do Roteiro MetamorphIA.\n"
-            f"- Na Pergunta 1, contemple: conteúdos/habilidades do Currículo Paulista escolhidos, o que o estudante já consegue fazer (consolidadas, em desenvolvimento, com ajuda), adaptações necessárias, recursos/apoios previstos e articulação do planejamento com o professor especializado do AEE.\n"
-            f"- Na Pergunta 2, integre estratégias pedagógicas, intervenções pedagógicas e recursos de acessibilidade segundo o DUA e articulados entre sala comum, AEE e gestão escolar (respeitando se o professor indicou que não utilizará algum item).\n"
-            f"- Na Pergunta 3, descreva os instrumentos diversificados e acessíveis de avaliação, reforçando o princípio de avaliar o progresso do estudante em relação a ele mesmo.\n"
-            f"- Na Pergunta 4, organize nos 4 grupos do Roteiro (Vídeos, Livros, Jogos, Atividades e exercícios) adaptados ao componente curricular e ao aluno, SEM inventar títulos fictícios de vídeos (ex: YouTube), livros, canais, autores ou URLs.\n"
+            f"DIRETRIZ DE CENTRALIDADE NAS RESPOSTAS DO PROFESSOR:\n"
+            f"- Una todas as respostas do professor abaixo e use-as como o eixo central de cada resposta geral.\n"
+            f"- Você pode complementar com estratégias ou desdobramentos pedagógicos que não foram citados explicitamente, "
+            f"desde que estejam diretamente alinhados e centralizados no que o professor respondeu e no perfil do estudante.\n"
+            f"- NÃO fuja do que o professor pediu, NÃO contradiga escolhas dele (ex: se indicou que não usará algo) e "
+            f"NÃO despeje listas genéricas de possíveis opções que não tenham relação direta com as respostas enviadas.\n"
+            f"- Gere a resposta APENAS para cada uma das 4 Perguntas Gerais (NÃO repita as subperguntas como perguntas no texto final).\n"
             f"- FORMATAÇÃO: escreva em texto corrido e tópicos simples ('• '). É PROIBIDO usar tabelas (Markdown ou quadros), marcações Markdown ('**', '###') e é PROIBIDO incluir citações de fonte ('*Fonte base:...*', 'Fonte:', 'Referências:').\n\n"
             f"Pergunta Geral 1: {PERGUNTAS_GERAIS_MODELO[1]}\n"
-            f"Norteamento obrigatório 1: {NORTEAMENTO_VERMELHO_PERGUNTAS_GERAIS[1]}\n"
-            f"Dados das subperguntas 1:\n{dados_p1}\n\n"
+            f"Respostas do Professor (Seção 1):\n{dados_p1}\n\n"
             f"Pergunta Geral 2: {PERGUNTAS_GERAIS_MODELO[2]}\n"
-            f"Norteamento obrigatório 2: {NORTEAMENTO_VERMELHO_PERGUNTAS_GERAIS[2]}\n"
-            f"Dados das subperguntas 2:\n{dados_p2}\n\n"
+            f"Respostas do Professor (Seção 2):\n{dados_p2}\n\n"
             f"Pergunta Geral 3: {PERGUNTAS_GERAIS_MODELO[3]}\n"
-            f"Norteamento obrigatório 3: {NORTEAMENTO_VERMELHO_PERGUNTAS_GERAIS[3]}\n"
-            f"Dados das subperguntas 3:\n{dados_p3}\n\n"
+            f"Respostas do Professor (Seção 3):\n{dados_p3}\n\n"
             f"Pergunta Geral 4: {PERGUNTAS_GERAIS_MODELO[4]}\n"
-            f"Norteamento obrigatório 4: {NORTEAMENTO_VERMELHO_PERGUNTAS_GERAIS[4]}\n"
-            f"Dados das subperguntas 4:\n{dados_p4}\n\n"
+            f"Respostas do Professor (Seção 4):\n{dados_p4}\n\n"
             f"Retorne APENAS um JSON válido com as chaves '1', '2', '3' e '4', contendo o texto limpo (sem tabelas, sem Markdown e sem fontes) de cada resposta geral."
         )
         try:

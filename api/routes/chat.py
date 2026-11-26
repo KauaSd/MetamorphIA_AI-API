@@ -38,7 +38,12 @@ from db_client import (
     registrar_turno_conversa_db,
     salvar_pei_arquivo_db,
 )
-from guardrails import sanitizar_dados_sensiveis, validar_e_higienizar_entrada
+from guardrails import (
+    MENSAGEM_RECUSA_ESCOPO,
+    eh_pedido_explicitamente_fora_escopo,
+    sanitizar_dados_sensiveis,
+    validar_escopo_pedagogico,
+)
 from llm_client import gerar_resposta_async
 from memoria.queries import buscar_documentos_referencia
 from schemas import (
@@ -233,6 +238,14 @@ async def post_chat(
 
     historico_conversa = ""
     eh_conversa_em_andamento = bool(mensagens_anteriores)
+
+    if eh_pedido_explicitamente_fora_escopo(mensagem_base):
+        return ChatResponse(resposta=MENSAGEM_RECUSA_ESCOPO, conversa_id=conversa_id)
+
+    if not eh_conversa_em_andamento:
+        no_escopo, msg_escopo = validar_escopo_pedagogico(texto_para_validacao)
+        if not no_escopo:
+            return ChatResponse(resposta=msg_escopo, conversa_id=conversa_id)
 
     if mensagens_anteriores:
         linhas_historico = []
@@ -608,7 +621,8 @@ async def post_chat(
         f"7. Evite tom burocrático ou juridicista: aplique a inclusão e acessibilidade naturalmente, sem ficar recitando leis ou decretos a todo momento.\n"
         f"8. Privacidade LGPD: Jamais armazene, solicite ou faça referência a documentos de identificação pessoal (CPF, RG, etc.).\n"
         f"9. Memória e PEI do Aluno: Sempre consulte e respeite o Perfil Consolidado (PEI + aprendizados de conversas anteriores) fornecido no contexto.\n"
-        f"10. Veracidade de Recursos: JAMAIS invente títulos fictícios de vídeos do YouTube, livros, canais, autores ou links inexistentes; ao recomendar vídeos ou materiais, indique apenas o formato, a proposta pedagógica e termos de busca."
+        f"10. Veracidade de Recursos: JAMAIS invente títulos fictícios de vídeos do YouTube, livros, canais, autores ou links inexistentes; ao recomendar vídeos ou materiais, indique apenas o formato, a proposta pedagógica e termos de busca.\n"
+        f"11. Escopo Estrito de Educação Inclusiva: Atue exclusivamente no apoio pedagógico inclusivo ao professor (adaptação de atividades, DUA e PEI). NUNCA faça trabalhos escolares, tarefas de casa ou correções gramaticais/ortográficas avulsas; se o pedido fugir desse escopo, recuse gentilmente e redirecione."
     )
 
     pediu_documento_pei = _eh_comando_documento_pei(msg_segura)

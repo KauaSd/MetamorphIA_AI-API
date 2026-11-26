@@ -24,6 +24,7 @@ from guardrails import (
     MENSAGEM_ALERTA_DADOS_SENSIVEIS,
     detectar_prompt_injection,
     sanitizar_dados_sensiveis,
+    validar_e_higienizar_entrada,
 )
 from llm_client import gerar_resposta_async
 from memoria.queries import buscar_documentos_referencia
@@ -327,15 +328,23 @@ async def perguntar_ia_post(
     payload: PerguntaRequest,
     _usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> dict[str, str]:
-    fontes = buscar_documentos_referencia(payload.pergunta, n_results=3)
-    prompt_pergunta = payload.pergunta
+    valido, pergunta_segura, msg_erro = validar_e_higienizar_entrada(payload.pergunta)
+    if not valido:
+        return {"resposta": msg_erro}
+
+    fontes = buscar_documentos_referencia(pergunta_segura, n_results=3)
+    prompt_pergunta = pergunta_segura
     if payload.instrucoes_ia and payload.instrucoes_ia.strip():
         inst_limpa, _ = sanitizar_dados_sensiveis(payload.instrucoes_ia.strip())
         prompt_pergunta = (
             f"INSTRUÇÕES PERSONALIZADAS DO PROFESSOR:\n{inst_limpa[:2000]}\n\n"
-            f"Pergunta do Professor:\n{payload.pergunta}"
+            f"Pergunta do Professor:\n{pergunta_segura}"
         )
-    resposta = await gerar_resposta_async(prompt_pergunta, fontes_referencia=fontes, formato_referencias="discreto")
+    resposta = await gerar_resposta_async(
+        prompt_pergunta,
+        fontes_referencia=fontes,
+        formato_referencias="discreto",
+    )
     return {"resposta": resposta}
 
 
