@@ -385,6 +385,39 @@ async def listar_conversas_lote_db(
     return dados if isinstance(dados, dict) else {}
 
 
+async def listar_conversas_recentes_db(
+    limit: Optional[int] = None,
+    offset: int = 0,
+    busca: Optional[str] = None,
+    ordenar_por: str = "data",
+    ordem: str = "desc",
+    token: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> list[dict[str, Any]]:
+    """Lista conversas recentes do usuário enriquecidas com dados do aluno e turma."""
+    url = f"{_obter_base_url(base_url)}/Alunos/conversas-recentes"
+    headers = _montar_headers(token)
+    params: dict[str, Any] = {
+        "offset": offset,
+        "ordenar_por": ordenar_por,
+        "ordem": ordem,
+    }
+    if limit is not None:
+        params["limit"] = limit
+    if busca:
+        params["busca"] = busca
+    async with obter_cliente_http(timeout) as client:
+        try:
+            resposta = await client.get(url, params=params, headers=headers, timeout=timeout)
+        except httpx.RequestError as exc:
+            raise DBClientError("Falha de conexão ao listar conversas recentes") from exc
+
+    _verificar_status_resposta(resposta, "Conversas recentes")
+    dados = resposta.json()
+    return dados if isinstance(dados, list) else []
+
+
 async def listar_conversas_aluno_db(
     id_aluno: int,
     incluir_metricas: bool = False,
@@ -425,6 +458,27 @@ async def obter_mensagens_conversa_db(
     _verificar_status_resposta(resposta, f"Conversa {conversa_id}")
     dados = resposta.json()
     return dados.get("mensagens", []) if isinstance(dados, dict) else []
+
+
+async def obter_conversa_por_id_db(
+    conversa_id: str,
+    token: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Recupera os metadados da conversa e suas mensagens pelo conversa_id."""
+    cid_seguro = quote(str(conversa_id).strip(), safe="")
+    url = f"{_obter_base_url(base_url)}/Alunos/conversas/{cid_seguro}"
+    headers = _montar_headers(token)
+    async with obter_cliente_http(timeout) as client:
+        try:
+            resposta = await client.get(url, headers=headers, timeout=timeout)
+        except httpx.RequestError as exc:
+            raise DBClientError(f"Falha de conexão ao obter conversa {conversa_id}") from exc
+
+    _verificar_status_resposta(resposta, f"Conversa {conversa_id}")
+    dados = resposta.json()
+    return dados if isinstance(dados, dict) else {}
 
 
 async def registrar_turno_conversa_db(

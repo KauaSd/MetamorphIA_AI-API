@@ -4,8 +4,8 @@ import asyncio
 import base64
 from datetime import datetime, timezone
 import uuid
-from typing import Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from typing import Any, Literal, Optional
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 
 from arquivo_utils import (
     DOCX_MEDIA_TYPE,
@@ -30,8 +30,10 @@ from db_client import (
     levantar_http_de_erro_db,
     listar_conversas_aluno_db,
     listar_conversas_lote_db,
+    listar_conversas_recentes_db,
     listar_peis_aluno_db,
     obter_aluno,
+    obter_conversa_por_id_db,
     obter_mensagens_conversa_db,
     obter_pei_detalhe_db,
     obter_turma,
@@ -50,7 +52,9 @@ from schemas import (
     AnexoItem,
     ChatRequest,
     ChatResponse,
+    ConversaCompleta,
     ConversaDetalhe,
+    ConversaRecenteItem,
     ConversaResumo,
     IndicadorDesenvolvimentoItem,
     MensagemItem,
@@ -914,6 +918,58 @@ async def get_conversas_lote(
         str(k): [ConversaResumo(**c) for c in (v or [])]
         for k, v in (agrupado or {}).items()
     }
+
+
+@router.get("/conversas/recentes", response_model=list[ConversaRecenteItem])
+async def get_conversas_recentes(
+    limit: Optional[int] = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    busca: Optional[str] = Query(default=None, max_length=120),
+    ordenar_por: Literal["data", "aluno", "titulo"] = "data",
+    ordem: Literal["desc", "asc"] = "desc",
+    usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
+) -> list[ConversaRecenteItem]:
+    """Retorna conversas recentes do professor em lista única ordenada, com dados do aluno e turma."""
+    validar_permissao_chat_usuario(usuario_autenticado)
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        lista = await listar_conversas_recentes_db(
+            limit=limit,
+            offset=offset,
+            busca=busca,
+            ordenar_por=ordenar_por,
+            ordem=ordem,
+            token=token_jwt,
+        )
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado="Conversas não encontradas.")
+    return [ConversaRecenteItem(**c) for c in (lista or [])]
+
+
+@router.get("/conversas/{conversa_id}", response_model=ConversaCompleta)
+async def get_conversa_por_id(
+    conversa_id: str,
+    usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
+) -> ConversaCompleta:
+    """Retorna os metadados da conversa e suas mensagens diretamente pelo conversa_id."""
+    validar_permissao_chat_usuario(usuario_autenticado)
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        dados = await obter_conversa_por_id_db(conversa_id, token=token_jwt)
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado="Conversa não encontrada.")
+    return ConversaCompleta(
+        conversa_id=str(dados.get("conversa_id") or conversa_id),
+        titulo=str(dados.get("titulo") or ""),
+        data=str(dados.get("data") or ""),
+        id_aluno=int(dados["id_aluno"]),
+        nome_aluno=str(dados.get("nome_aluno") or ""),
+        neuro_aluno=str(dados.get("neuro_aluno") or ""),
+        id_turma=dados.get("id_turma"),
+        nome_turma=dados.get("nome_turma"),
+        pei_ativo=bool(dados.get("pei_ativo", False)),
+        mensagens=[MensagemItem(**m) for m in (dados.get("mensagens") or [])],
+    )
 
 
 @router.get("/alunos/{id_aluno}/conversas", response_model=list[ConversaResumo])

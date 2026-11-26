@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Any
 
 PALAVRAS_CHAVE_ESCOPO = {
@@ -11,11 +12,14 @@ PALAVRAS_CHAVE_ESCOPO = {
     "sensorial", "processamento auditivo", "cegueira", "baixa visão", "surdez",
     "pei", "plano educacional individualizado", "plano de ensino individualizado", "aee",
     "atendimento educacional especializado", "dua", "desenho universal", "aprendizagem",
-    "adaptação", "adaptar", "atividade", "tarefa", "tarefas", "avaliação", "currículo",
-    "pedagógico", "pedagógica", "professor", "professora", "aluno", "aluna", "estudante",
-    "escola", "sala de aula", "aula", "intervenção", "comportamento", "rotina", "transição",
+    "adaptação", "adaptações", "adaptar", "adaptado", "adaptada",
+    "atividade", "atividades", "tarefa", "tarefas", "avaliação", "avaliações", "currículo",
+    "conteúdo", "conteúdos", "ensino",
+    "pedagógico", "pedagógica", "professor", "professora", "aluno", "alunos", "aluna", "estudante", "estudantes",
+    "escola", "sala de aula", "aula", "aulas", "intervenção", "comportamento", "rotina", "transição",
     "transições", "crise", "crises", "leitura", "alfabetização", "fonológica", "matemática",
-    "dezena", "metodologia", "estratégia", "recurso", "recurso visual", "material concreto",
+    "subtração", "adição", "multiplicação", "divisão",
+    "dezena", "metodologia", "metodologias", "estratégia", "estratégias", "recurso", "recursos", "recurso visual", "material concreto",
     "tempo estendido", "enriquecimento", "entediado", "atrapalhando", "como lidar",
     "mediação", "inclusão", "inclusivo", "inclusiva", "decreto", "legislação", "orientação",
 }
@@ -162,13 +166,19 @@ _PADRAO_SAUDACAO_OU_CONVERSACIONAL = re.compile(
 )
 
 
+def _remover_acentos(texto: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", texto or "") if not unicodedata.combining(c)
+    )
+
+
 _PADROES_ESCOPO = [
-    re.compile(rf"(?<!\w){re.escape(termo)}(?!\w)", re.IGNORECASE)
+    re.compile(rf"(?<!\w){re.escape(_remover_acentos(termo))}(?!\w)", re.IGNORECASE)
     for termo in PALAVRAS_CHAVE_ESCOPO
 ]
 
 _TERMOS_PEDAGOGIA_INCLUSIVA = (
-    "adaptar", "adaptação", "adaptada", "adaptado",
+    "adaptar", "adaptação", "adaptações", "adaptada", "adaptado",
     "inclusão", "inclusivo", "inclusiva",
     "neurodivergente", "neurodivergência", "neurodiversidade",
     "tea", "autismo", "autista", "tdah", "dislexia", "discalculia",
@@ -177,7 +187,7 @@ _TERMOS_PEDAGOGIA_INCLUSIVA = (
 )
 
 _PADROES_PEDAGOGIA_INCLUSIVA = [
-    re.compile(rf"(?<!\w){re.escape(termo)}(?!\w)", re.IGNORECASE)
+    re.compile(rf"(?<!\w){re.escape(_remover_acentos(termo))}(?!\w)", re.IGNORECASE)
     for termo in _TERMOS_PEDAGOGIA_INCLUSIVA
 ]
 
@@ -194,7 +204,8 @@ _PADROES_FORA_ESCOPO_EXPLICITO = [
 def eh_pedido_explicitamente_fora_escopo(texto: str) -> bool:
     if not texto:
         return False
-    if any(p.search(texto) for p in _PADROES_PEDAGOGIA_INCLUSIVA):
+    texto_sem_acento = _remover_acentos(texto)
+    if any(p.search(texto_sem_acento) for p in _PADROES_PEDAGOGIA_INCLUSIVA):
         return False
     return any(p.search(texto) for p in _PADROES_FORA_ESCOPO_EXPLICITO)
 
@@ -204,7 +215,7 @@ def validar_escopo_pedagogico(texto: str) -> tuple[bool, str]:
         return False, "Por favor, digite sua pergunta pedagógica ou solicitação de adaptação."
 
     texto_limpo = texto.strip()
-    texto_lower = texto_limpo.lower()
+    texto_lower = _remover_acentos(texto_limpo.lower())
 
     if eh_pedido_explicitamente_fora_escopo(texto_limpo):
         return False, MENSAGEM_RECUSA_ESCOPO

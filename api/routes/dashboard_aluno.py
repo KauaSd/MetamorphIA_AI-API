@@ -474,6 +474,7 @@ async def get_aluno_dashboard(
         turma=nome_turma,
         diagnostico=diagnostico_limpo,
         status_diagnostico=status_diag,
+        desc_aluno=aluno.desc_aluno,
         perfil_ia=perfil_ia,
         descricao_breve=_montar_descricao_breve(
             aluno.nome_aluno, diagnostico_limpo, perfil_ia, aluno.desc_aluno

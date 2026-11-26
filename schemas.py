@@ -110,8 +110,24 @@ class ConversaResumo(BaseModel):
     data: str
 
 
+class ConversaRecenteItem(BaseModel):
+    conversa_id: str
+    titulo: str
+    data: str
+    id_aluno: int
+    nome_aluno: str
+    neuro_aluno: str
+    id_turma: Optional[int] = None
+    nome_turma: Optional[str] = None
+
+
 class ConversaDetalhe(BaseModel):
     conversa_id: str
+    mensagens: List[MensagemItem]
+
+
+class ConversaCompleta(ConversaRecenteItem):
+    pei_ativo: bool = False
     mensagens: List[MensagemItem]
 
 
@@ -169,6 +185,7 @@ class AlunoDashboardResponse(BaseModel):
     turma: str
     diagnostico: str
     status_diagnostico: StatusDiagnostico
+    desc_aluno: Optional[str] = None
     perfil_ia: Optional[str] = None
     descricao_breve: Optional[str] = None
     pei_gerado: bool
