@@ -30,7 +30,7 @@ from db_client import (
     obter_turma,
     salvar_pei_arquivo_db,
 )
-from guardrails import sanitizar_dados_sensiveis
+from guardrails import detectar_prompt_injection, sanitizar_dados_sensiveis
 from llm_client import gerar_resposta
 from memoria.queries import buscar_documentos_referencia
 from memoria.student_vectors import dividir_texto_pei_em_chunks, indexar_contexto_aluno_pgvector
@@ -590,6 +590,10 @@ def gerar_respostas_gerais_pei(
 ) -> dict[int, str]:
     agrupadas: dict[int, list[str]] = {1: [], 2: [], 3: [], 4: []}
     for idx, item in enumerate(respostas_subperguntas):
+        eh_inj_p, _ = detectar_prompt_injection(item.pergunta)
+        eh_inj_r, _ = detectar_prompt_injection(item.resposta)
+        if eh_inj_p or eh_inj_r:
+            continue
         perg_limpa, _ = sanitizar_dados_sensiveis(item.pergunta)
         resp_limpa, _ = sanitizar_dados_sensiveis(item.resposta)
         num_geral = _classificar_pergunta_geral(item, idx)
@@ -645,7 +649,8 @@ def gerar_respostas_gerais_pei(
             f"Contexto do Estudante: {contexto_aluno}\n\n"
             f"DIRETRIZ DE CENTRALIDADE E FIDELIDADE ESTRITA ÀS RESPOSTAS DO PROFESSOR:\n"
             f"- Baseie cada resposta geral ESTRITAMENTE no que o professor selecionou/respondeu abaixo e no contexto real do estudante.\n"
-            f"- PROIBIDO inventar, acrescentar ou presumir adaptações, recursos, conteúdos ou série/ano que NÃO foram escolhidos pelo professor (ex.: se o professor NÃO escolheu alto contraste, fonte ampliada, abafadores/protetores auriculares, jogos, livros, planilha diária ou mediação em grupo, é PROIBIDO incluir esses itens).\n"
+            f"- PROIBIDO inventar, acrescentar ou presumir habilidades, conteúdos, adaptações, recursos, instrumentos ou série/ano que NÃO foram escolhidos/digitados pelo professor (ex.: se o professor NÃO citou coordenação motora grossa, percepção espacial, linguagem corporal, alto contraste, fonte ampliada, abafadores/protetores auriculares, jogos, livros, planilha diária ou mediação em grupo, é PROIBIDO incluir esses itens).\n"
+            f"- FIDELIDADE À RESPOSTA LIVRE: preserve o sentido exato do que o professor digitou sem substituir por outra habilidade ou acrescentar exigências não citadas.\n"
             f"- SÉRIE/ANO E CONTEÚDOS: Use EXCLUSIVAMENTE a série/ano '{ano_escolar}' informada. PROIBIDO inventar '1º ano' ou listar conteúdos específicos (ex.: números de 0 a 20, adição/subtração) que não estejam nas respostas do professor ou nos trechos do Currículo Paulista recuperados para '{ano_escolar}'.\n"
             f"- SEÇÃO 1: Inclua explicitamente o que o estudante já consegue fazer (Pergunta 1.1) abrindo a resposta da Seção 1.\n"
             f"- NÃO fuja do que o professor pediu, NÃO contradiga escolhas dele (ex: se indicou que não usará algo) e NÃO despeje listas genéricas.\n"
@@ -1131,9 +1136,18 @@ async def _processar_criacao_pei(
 
     from api.routes.dashboard_aluno import calcular_status_multi_pei_usuario
 
+    tags_multi_pei = usuario_autenticado.get("tags") or []
+    if aluno.id_turma:
+        try:
+            turma_pei = await obter_turma(aluno.id_turma, token=token_jwt)
+            if getattr(turma_pei, "disciplinas", None):
+                tags_multi_pei = list(turma_pei.disciplinas)
+        except Exception:
+            pass
+
     status_multi = calcular_status_multi_pei_usuario(
         aluno=aluno,
-        tags_usuario=usuario_autenticado.get("tags") or [],
+        tags_usuario=tags_multi_pei,
         disciplina_recem_concluida=componente,
     )
 
@@ -1359,9 +1373,18 @@ async def importar_pei_arquivo(
 
     from api.routes.dashboard_aluno import calcular_status_multi_pei_usuario
 
+    tags_multi_pei = usuario_autenticado.get("tags") or []
+    if aluno.id_turma:
+        try:
+            turma_pei = await obter_turma(aluno.id_turma, token=token_jwt)
+            if getattr(turma_pei, "disciplinas", None):
+                tags_multi_pei = list(turma_pei.disciplinas)
+        except Exception:
+            pass
+
     status_multi = calcular_status_multi_pei_usuario(
         aluno=aluno,
-        tags_usuario=usuario_autenticado.get("tags") or [],
+        tags_usuario=tags_multi_pei,
         disciplina_recem_concluida=componente,
     )
 

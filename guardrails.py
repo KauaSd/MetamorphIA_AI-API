@@ -61,10 +61,10 @@ MENSAGEM_ALERTA_INJECTION = (
 
 MENSAGEM_ALERTA_DADOS_SENSIVEIS = (
     "Aviso de Privacidade MetamorphIA: Detectamos dados pessoais identificáveis ou sensíveis "
-    "(como CPF, RG, telefone ou documento) na sua mensagem. Por diretrizes de proteção e "
-    "conformidade com a LGPD, o sistema não aceita nem processa documentos civis de estudantes ou responsáveis. "
+    "(como CPF, RG, telefone, endereço, nome de responsáveis ou documento) na sua mensagem. Por diretrizes de proteção e "
+    "conformidade com a LGPD, o sistema não aceita nem inclui dados civis ou de contato de estudantes ou responsáveis no PEI. "
     "A requisição foi interrompida para proteger a privacidade. Por favor, reformule sua mensagem informando "
-    "apenas o contexto e os objetivos pedagógicos."
+    "apenas o contexto e os objetivos pedagógicos para continuarmos o PEI."
 )
 
 
@@ -144,6 +144,24 @@ def sanitizar_dados_sensiveis(texto: str) -> tuple[str, list[str]]:
         cep = match.group(1)
         texto_sanitizado = texto_sanitizado.replace(cep, "[CEP_PROTEGIDO]")
         dados_encontrados.append("CEP")
+
+    padrao_endereco = (
+        r"(?i)\b(?:rua|avenida|av\.?|travessa|alameda|estrada|rodovia|pra[çc]a)"
+        r"\s+[A-Za-zÀ-ÿ0-9\s.'-]{2,50},?\s*(?:n[º°]?\s*)?\d+\b"
+    )
+    if re.search(padrao_endereco, texto_sanitizado):
+        texto_sanitizado = re.sub(padrao_endereco, "[ENDERECO_PROTEGIDO]", texto_sanitizado)
+        dados_encontrados.append("ENDERECO")
+
+    padrao_responsavel = (
+        r"(?i)\b(?:filh[oa]\s+d[eao]|m[ãa]e|pai|respons[áa]vel)\s*(?:[:\-]|chamada|chamado)?\s*"
+        r"(?:d[eao]\s+)?([A-ZÀ-Ý][a-zà-ÿ]+(?:\s+(?:d[aeo]s?\s+)?[A-ZÀ-Ý][a-zà-ÿ]+){0,3})"
+    )
+    for match in re.finditer(padrao_responsavel, texto_sanitizado):
+        nome_resp = match.group(1).strip()
+        if nome_resp and nome_resp.lower() not in ("aluno", "estudante", "lucas"):
+            texto_sanitizado = texto_sanitizado.replace(nome_resp, "[RESPONSAVEL_PROTEGIDO]")
+            dados_encontrados.append("RESPONSAVEL")
 
     return texto_sanitizado, list(set(dados_encontrados))
 
@@ -232,6 +250,14 @@ _PADROES_RESPOSTA_PRONTA = [
     re.compile(
         r"\b(?:qual|me\s+d[eê]|diga|responda|resolva|calcule)\s+"
         r"(?:a\s+|o\s+)?(?:resposta\s+(?:certa|correta)|gabarito|resultado\s+(?:de|da|do)|essa\s+conta|essa\s+equa[cç][aã]o|essa\s+quest[aã]o)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bquanto\s+(?:[eé]|d[aá]|vale)\s+\d+(?:[.,]\d+)?\s*(?:[x×*+\-/÷]|vezes|mais|menos|dividido(?:\s+por)?)\s*\d+",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:como\s+resolver\s+(?:uma\s+)?equa[cç][aã]o|para\s+(?:uma|a|minha)\s+prova(?:\s+minha)?)\b",
         re.IGNORECASE,
     ),
     re.compile(r"\bresolva\s+(?:essa|esta|a|o)\s+(?:conta|equa[cç][aã]o|exerc[ií]cio|problema|atividade|quest[aã]o)\b", re.IGNORECASE),

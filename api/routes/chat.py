@@ -42,6 +42,7 @@ from db_client import (
     salvar_pei_arquivo_db,
 )
 from guardrails import (
+    MENSAGEM_ALERTA_DADOS_SENSIVEIS,
     MENSAGEM_RECUSA_ESCOPO,
     auditar_resposta_ia,
     detectar_pedido_programacao_ou_resposta_pronta,
@@ -123,8 +124,27 @@ _TERMOS_REVISAO_PEI = (
 )
 
 
+def _detectar_pedido_preencher_pei_sozinha(texto: str) -> bool:
+    t = (texto or "").strip().lower()
+    if "pei" not in t:
+        return False
+    return any(
+        p in t
+        for p in (
+            "não quero escolher",
+            "nao quero escolher",
+            "preencha o pei inteiro",
+            "preencher o pei inteiro",
+            "preencha tudo",
+            "do jeito que achar melhor",
+            "do jeito que você achar melhor",
+            "do jeito que voce achar melhor",
+        )
+    )
+
+
 def _detectar_pedido_revisao_pei(texto: str) -> bool:
-    if _eh_comando_documento_pei(texto):
+    if _eh_comando_documento_pei(texto) or _detectar_pedido_preencher_pei_sozinha(texto):
         return False
     t = (texto or "").strip().lower()
     if any(termo in t for termo in _TERMOS_REVISAO_PEI):
@@ -166,6 +186,7 @@ def _exigir_pei_valido_aluno(
     aluno,
     usuario_autenticado: Optional[dict[str, Any]] = None,
     permitir_revisao_pei: bool = False,
+    disciplinas_turma: Optional[list[str]] = None,
 ) -> None:
     """Garante que o aluno possui todos os PEIs das disciplinas do professor concluídos e dentro da validade (60 dias)."""
     if not aluno.pei_ativo:
@@ -185,7 +206,11 @@ def _exigir_pei_valido_aluno(
     todos_concluidos = getattr(aluno, "todos_peis_concluidos", None)
     pendentes = list(getattr(aluno, "disciplinas_pendentes", None) or [])
     if todos_concluidos is None and usuario_autenticado is not None:
-        tags_jwt = usuario_autenticado.get("tags") or []
+        tags_jwt = (
+            list(disciplinas_turma)
+            if disciplinas_turma
+            else (usuario_autenticado.get("tags") or [])
+        )
         if tags_jwt:
             from api.routes.dashboard_aluno import calcular_status_multi_pei_usuario
 
@@ -304,10 +329,20 @@ async def post_chat(
             or _eh_comando_documento_pei(msg_bruta)
         )
     )
+    disciplinas_turma_aluno: Optional[list[str]] = None
+    if getattr(aluno, "id_turma", None) and not eh_fluxo_revisao_pei:
+        try:
+            turma_chat = await obter_turma(aluno.id_turma, token=token_jwt)
+            if getattr(turma_chat, "disciplinas", None):
+                disciplinas_turma_aluno = list(turma_chat.disciplinas)
+        except Exception:
+            pass
+
     _exigir_pei_valido_aluno(
         aluno,
         usuario_autenticado,
         permitir_revisao_pei=eh_fluxo_revisao_pei,
+        disciplinas_turma=disciplinas_turma_aluno,
     )
 
     anexos_recebidos = payload.anexos or []
@@ -353,7 +388,18 @@ async def post_chat(
     if eh_proibido:
         return ChatResponse(resposta=alerta_proibido, conversa_id=conversa_id)
 
-    msg_segura, _ = sanitizar_dados_sensiveis(mensagem_base)
+    msg_segura, dados_sensiveis_encontrados = sanitizar_dados_sensiveis(mensagem_base)
+    if dados_sensiveis_encontrados:
+        return ChatResponse(resposta=MENSAGEM_ALERTA_DADOS_SENSIVEIS, conversa_id=conversa_id)
+
+    if _detectar_pedido_preencher_pei_sozinha(msg_segura):
+        resp_autonomia = (
+            f"O PEI de **{aluno.nome_aluno}** depende das suas escolhas como professor(a), pois é você quem "
+            f"acompanha o estudante em sala. Não posso preencher o documento inteiro como definitivo por conta própria.\n\n"
+            f"Vamos seguir o fluxo normal por etapas! Na **Parte 1 (O que o estudante já consegue fazer e conteúdos do Currículo Paulista)**, "
+            f"você pode escolher uma das opções (A a D) ou digitar livremente o que observa no aluno para iniciarmos."
+        )
+        return ChatResponse(resposta=resp_autonomia, conversa_id=conversa_id)
 
     if eh_pedido_explicitamente_fora_escopo(mensagem_base):
         return ChatResponse(resposta=MENSAGEM_RECUSA_ESCOPO, conversa_id=conversa_id)
@@ -776,18 +822,18 @@ async def post_chat(
 
     bloco_arquivos_prompt = ""
     if textos_anexos:
-        modo_adaptacao_usado = "fiel"
+        modo_adaptacao_usado = "ideias"
         bloco_arquivos_prompt = (
-            "CONTEÚDO DO(S) ARQUIVO(S) ENVIADO(S) PELO PROFESSOR PARA ADAPTAÇÃO (MODO FIEL AO ARQUIVO ORIGINAL):\n"
+            "CONTEÚDO DO(S) ARQUIVO(S) ENVIADO(S) PELO PROFESSOR:\n"
             + "\n\n".join(textos_anexos)
             + "\n\n"
-            "IMPORTANTE (MODO FIEL AO ARQUIVO ORIGINAL): O professor enviou um arquivo PDF/DOCX de atividade. "
-            "Você DEVE manter a estrutura, a ordem e todas as questões originais do arquivo enviado, "
-            "adaptando apenas a linguagem, o fracionamento dos enunciados, os apoios visuais/concretos e a acessibilidade "
-            "para o perfil do estudante. Sua resposta será entregue ao professor em arquivo (.docx / .pdf) pronto para download.\n\n"
+            "IMPORTANTE: Leia o material enviado pelo professor e forneça APENAS ideias e sugestões práticas "
+            "de como adaptar essa atividade para o perfil do estudante (linguagem, fracionamento dos enunciados, "
+            "apoios visuais/concretos, acessibilidade e estratégias em sala). "
+            "NÃO crie, não reescreva a atividade inteira e NÃO gere arquivo para download.\n\n"
         )
     elif template_escolhido:
-        modo_adaptacao_usado = "template"
+        modo_adaptacao_usado = "ideias"
         template_usado_id = template_escolhido["id"]
         _PEDIDOS_ATIVIDADE_PENDENTES.pop(chave_pendente, None)
         contexto_tema = (
@@ -796,12 +842,11 @@ async def post_chat(
             else ""
         )
         bloco_arquivos_prompt = (
-            f"CRIAÇÃO DE ATIVIDADE ADAPTADA BASEADA EM TEMPLATE PEDAGÓGICO:\n"
-            f"Template escolhido pelo professor: {template_escolhido['nome']} ({template_escolhido['id']})\n"
+            f"ORIENTAÇÃO PEDAGÓGICA BASEADA EM ESTRATÉGIA INCLUSIVA:\n"
+            f"Referência selecionada: {template_escolhido['nome']} ({template_escolhido['id']})\n"
             f"{contexto_tema}"
-            f"{template_escolhido['instrucao_prompt']}\n\n"
-            "IMPORTANTE: Gere a atividade adaptada completa, estruturada exatamente segundo o template acima e pronta "
-            "para aplicação com o estudante, pois ela será entregue em arquivo (.docx / .pdf) para download.\n\n"
+            "IMPORTANTE: Forneça apenas ideias e sugestões práticas de adaptação pedagógica para o professor aplicar com o estudante. "
+            "NÃO crie atividades completas prontas nem gere arquivos para download.\n\n"
         )
 
     bloco_instrucoes_prof = ""
@@ -832,26 +877,13 @@ async def post_chat(
         f"8. Privacidade LGPD: Jamais armazene, solicite ou faça referência a documentos de identificação pessoal (CPF, RG, etc.).\n"
         f"9. Memória e PEI do Aluno: Sempre consulte e respeite o Perfil Consolidado (PEI + aprendizados de conversas anteriores) fornecido no contexto.\n"
         f"10. Veracidade de Recursos: JAMAIS invente títulos fictícios de vídeos do YouTube, livros, canais, autores ou links inexistentes; ao recomendar vídeos ou materiais, indique apenas o formato, a proposta pedagógica e termos de busca.\n"
-        f"11. Escopo Estrito de Educação Inclusiva: Atue exclusivamente no apoio pedagógico inclusivo ao professor (adaptação de atividades, DUA e PEI). NUNCA faça trabalhos escolares, tarefas de casa ou correções gramaticais/ortográficas avulsas; se o pedido fugir desse escopo, recuse gentilmente e redirecione."
+        f"11. Escopo Estrito de Educação Inclusiva: Atue exclusivamente no apoio pedagógico inclusivo ao professor (adaptação de atividades, DUA e PEI). NUNCA faça trabalhos escolares, tarefas de casa ou correções gramaticais/ortográficas avulsas; se o pedido fugir desse escopo, recuse gentilmente e redirecione.\n"
+        f"12. Apenas Ideias de Adaptação: Nunca gere ou entregue atividades completas prontas para impressão/download; ao receber um arquivo ou pedido de adaptação, leia o conteúdo e apresente apenas ideias, recomendações e estratégias práticas de adaptação."
     )
 
     pediu_documento_pei = _eh_comando_documento_pei(msg_segura)
-    deve_gerar_arquivo_atividade = bool(
-        anexos_recebidos
-        or template_escolhido is not None
-        or payload.gerar_arquivo_atividade
-        or any(
-            termo in msg_segura.lower()
-            for termo in (
-                "atividade adaptada em arquivo",
-                "gerar arquivo",
-                "mandar arquivo",
-                "enviar arquivo",
-                "baixar atividade",
-                "documento da atividade",
-            )
-        )
-    )
+    # A IA nao gera mais arquivos de atividade; apenas le e sugere ideias de adaptacao.
+    deve_gerar_arquivo_atividade = False
 
     formato_escolhido = (payload.formato_saida or "docx").strip().lower()
     if formato_escolhido not in ("docx", "pdf"):

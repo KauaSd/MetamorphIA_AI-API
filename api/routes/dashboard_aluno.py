@@ -333,10 +333,14 @@ async def get_aluno_descricao_breve(
         levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado.")
 
     nome_turma = "Sem turma atribuída"
+    disciplinas_turma: list[str] = []
     if aluno.id_turma:
         try:
             turma = await obter_turma(aluno.id_turma, token=token_jwt)
             nome_turma = turma.nome_turma or f"Turma {aluno.id_turma}"
+            disciplinas_turma = [
+                str(d).strip() for d in (getattr(turma, "disciplinas", None) or []) if str(d).strip()
+            ]
         except Exception:
             nome_turma = f"Turma {aluno.id_turma}"
 
@@ -372,10 +376,14 @@ async def get_aluno_dashboard(
         levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado.")
 
     nome_turma = "Sem turma atribuída"
+    disciplinas_turma: list[str] = []
     if aluno.id_turma:
         try:
             turma = await obter_turma(aluno.id_turma, token=token_jwt)
             nome_turma = turma.nome_turma or f"Turma {aluno.id_turma}"
+            disciplinas_turma = [
+                str(d).strip() for d in (getattr(turma, "disciplinas", None) or []) if str(d).strip()
+            ]
         except Exception:
             nome_turma = f"Turma {aluno.id_turma}"
 
@@ -404,8 +412,12 @@ async def get_aluno_dashboard(
         conversas = []
         perfil_ia = None
 
-    # Monta PEIs por disciplina com base nas tags (disciplinas) do professor autenticado
-    tags_prof = [str(t).strip() for t in (usuario_autenticado.get("tags") or []) if str(t).strip()]
+    # Monta PEIs por disciplina com base nas disciplinas da turma (ou fallback nas tags do professor)
+    tags_prof = (
+        disciplinas_turma
+        if disciplinas_turma
+        else [str(t).strip() for t in (usuario_autenticado.get("tags") or []) if str(t).strip()]
+    )
     status_por_chave: dict[str, str] = {}
     datas_concluidos: list[datetime] = []
     for reg in aluno.peis_disciplinas or []:

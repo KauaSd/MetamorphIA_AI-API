@@ -52,6 +52,7 @@ class TurmaDB(BaseModel):
     serie_ano: Optional[str] = None
     letra: Optional[str] = None
     horario: Optional[str] = None
+    disciplinas: List[str] = Field(default_factory=list)
     id_prof: Optional[int] = Field(
         default=None, validation_alias=AliasChoices("id_prof", "fk_Usuario_id_usuario")
     )
