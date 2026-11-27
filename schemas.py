@@ -25,6 +25,9 @@ class AlunoDB(BaseModel):
     pei_feito: bool = False
     pei_valido_ate: Optional[str] = None
     pei_ativo: Optional[bool] = None
+    todos_peis_concluidos: Optional[bool] = None
+    disciplinas_concluidas: List[str] = Field(default_factory=list)
+    disciplinas_pendentes: List[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _resolver_pei_ativo(self) -> "AlunoDB":
@@ -77,6 +80,22 @@ class ChatRequest(BaseModel):
     formato_saida: Optional[str] = "docx"
     instrucoes_ia: Optional[str] = None
     persistido_pelo_gateway: bool = False
+    modo_teste_analisador: bool = False
+    limiar_analisador: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+    modo_revisao_pei: bool = False
+
+
+class AnaliseEntradaTeste(BaseModel):
+    porcentagem: float
+    limiar: float
+    aprovado: bool
+    motivo: str
+    relacionado_ao_aluno_ou_pei: bool = True
+    pede_resposta_pronta_ou_codigo: bool = False
+    disciplina_identificada: Optional[str] = None
+    similaridade_pgvector: float = 0.0
+    chunks_utilizados: int = 0
+    latencia_analisador_ms: Optional[float] = None
 
 
 class ChatResponse(BaseModel):
@@ -95,6 +114,7 @@ class ChatResponse(BaseModel):
     modo_adaptacao_usado: Optional[str] = None
     template_usado: Optional[str] = None
     formato_arquivo: Optional[str] = None
+    analise_entrada: Optional[AnaliseEntradaTeste] = None
 
 
 class MensagemItem(BaseModel):
@@ -150,6 +170,8 @@ class PeisPorDisciplinaResumo(BaseModel):
     prazo_expirado: bool = False
     ultimo_envio: Optional[str] = None
     proximo_periodo: Optional[str] = None
+    todos_concluidos: bool = False
+    pendentes: List[str] = Field(default_factory=list)
     disciplinas: List[PeiDisciplinaItem] = Field(default_factory=list)
 
 
@@ -299,6 +321,8 @@ class PeiCriarResponse(BaseModel):
     metas_bimestre: Optional[List[MetaBimestreItem]] = None
     pei_feito: bool = True
     pei_valido_ate: Optional[str] = None
+    todos_peis_concluidos: Optional[bool] = None
+    disciplinas_pendentes: List[str] = Field(default_factory=list)
 
 
 class PeiResumo(BaseModel):

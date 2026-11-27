@@ -169,9 +169,9 @@ async def obter_alunos_por_turma(
     url = f"{_obter_base_url(base_url)}/Alunos"
     headers = _montar_headers(token)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.get(url, params={"id_turma": int(id_turma)}, headers=headers)
+            resposta = await client.get(url, params={"id_turma": int(id_turma)}, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao buscar alunos da turma {id_turma}") from exc
 
@@ -217,9 +217,9 @@ async def atualizar_descricao_aluno(
     url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/descricao"
     headers = _montar_headers(token)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.patch(url, json=corpo, headers=headers)
+            resposta = await client.patch(url, json=corpo, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao atualizar contexto do aluno {id_aluno}") from exc
 
@@ -264,9 +264,9 @@ async def salvar_pei_arquivo_db(
 
     url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/pei-arquivo"
     headers = _montar_headers(token)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.post(url, json=corpo, headers=headers)
+            resposta = await client.post(url, json=corpo, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao salvar PEI do aluno {id_aluno}") from exc
 
@@ -289,9 +289,9 @@ async def atualizar_status_pei_disciplina_db(
     corpo: dict[str, Any] = {"disciplina": disciplina, "status": status_pei}
     if pei_id:
         corpo["pei_id"] = pei_id
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.post(url, json=corpo, headers=headers)
+            resposta = await client.post(url, json=corpo, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao atualizar PEI da disciplina {disciplina}") from exc
     _verificar_status_resposta(resposta, f"PEI disciplina {disciplina}")
@@ -504,9 +504,9 @@ async def registrar_turno_conversa_db(
         "anexos_usuario": anexos_usuario,
         "anexos_ia": anexos_ia,
     }
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.post(url, json=corpo, headers=headers)
+            resposta = await client.post(url, json=corpo, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao registrar conversa do aluno {id_aluno}") from exc
 
@@ -525,14 +525,76 @@ async def excluir_conversa_aluno_db(
     cid_seguro = quote(str(conversa_id).strip(), safe="")
     url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/conversas-db/{cid_seguro}"
     headers = _montar_headers(token)
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with obter_cliente_http(timeout) as client:
         try:
-            resposta = await client.delete(url, headers=headers)
+            resposta = await client.delete(url, headers=headers, timeout=timeout)
         except httpx.RequestError as exc:
             raise DBClientError(f"Falha de conexão ao excluir conversa {conversa_id}") from exc
 
     _verificar_status_resposta(resposta, f"Excluir conversa {conversa_id}")
     return resposta.json()
+
+
+async def salvar_vetores_aluno_db(
+    id_aluno: int,
+    origem: str,
+    itens: list[dict[str, Any]],
+    disciplina: Optional[str] = None,
+    pei_id: Optional[str] = None,
+    conversa_id: Optional[str] = None,
+    substituir_origem_disciplina: bool = False,
+    token: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 15.0,
+) -> dict[str, Any]:
+    """Persiste chunks vetorizados (pgvector) de PEI/relatos do aluno na API-DB."""
+    url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/vetores"
+    headers = _montar_headers(token)
+    corpo: dict[str, Any] = {
+        "origem": origem,
+        "disciplina": disciplina,
+        "pei_id": pei_id,
+        "conversa_id": conversa_id,
+        "substituir_origem_disciplina": bool(substituir_origem_disciplina),
+        "itens": itens,
+    }
+    async with obter_cliente_http(timeout) as client:
+        try:
+            resposta = await client.post(url, json=corpo, headers=headers, timeout=timeout)
+        except httpx.RequestError as exc:
+            raise DBClientError(f"Falha de conexão ao salvar vetores do aluno {id_aluno}") from exc
+
+    _verificar_status_resposta(resposta, f"Salvar vetores do aluno {id_aluno}")
+    return resposta.json()
+
+
+async def buscar_vetores_aluno_db(
+    id_aluno: int,
+    embedding: list[float],
+    top_k: int = 6,
+    disciplina: Optional[str] = None,
+    token: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
+    """Busca os chunks mais próximos do aluno no pgvector da API-DB."""
+    url = f"{_obter_base_url(base_url)}/Alunos/{int(id_aluno)}/vetores/busca"
+    headers = _montar_headers(token)
+    corpo: dict[str, Any] = {
+        "embedding": embedding,
+        "top_k": int(top_k),
+    }
+    if disciplina:
+        corpo["disciplina"] = disciplina
+    async with obter_cliente_http(timeout) as client:
+        try:
+            resposta = await client.post(url, json=corpo, headers=headers, timeout=timeout)
+        except httpx.RequestError as exc:
+            raise DBClientError(f"Falha de conexão ao buscar vetores do aluno {id_aluno}") from exc
+
+    _verificar_status_resposta(resposta, f"Buscar vetores do aluno {id_aluno}")
+    dados = resposta.json()
+    return dados if isinstance(dados, dict) else {"trechos": [], "disciplinas_pei": []}
 
 
 class DBClient:

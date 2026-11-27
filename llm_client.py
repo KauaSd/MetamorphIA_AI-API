@@ -17,6 +17,7 @@ from typing import Any, Iterator, Optional
 
 from config import get_settings
 from guardrails import (
+    auditar_resposta_ia,
     garantir_referencias_finais,
     sanitizar_dados_sensiveis,
     validar_e_higienizar_entrada,
@@ -71,7 +72,12 @@ PROMPT_SISTEMA_METAMORPHIA = (
     "11. Veracidade de Recursos (PROIBIDO INVENTAR TÍTULOS OU LINKS): JAMAIS invente títulos fictícios de vídeos do YouTube, "
     "canais, livros, autores, jogos específicos ou links/URLs que não constem explicitamente nos documentos de referência. "
     "Ao recomendar vídeos, livros ou jogos, descreva apenas o formato/tipo do recurso, critérios de acessibilidade e palavras-chave "
-    "de busca (sem colocar nomes inventados entre aspas)."
+    "de busca (sem colocar nomes inventados entre aspas).\n"
+    "12. ZERO RESPOSTAS PRONTAS E ZERO CÓDIGO: Você NUNCA resolve exercícios, NUNCA dá o gabarito ou resultado de contas/questões, "
+    "NUNCA escreve redações prontas e NUNCA escreve código de programação ou scripts em nenhuma linguagem (mesmo se citado o nome do aluno). "
+    "Entregue EXCLUSIVAMENTE estratégias de adaptação pedagógica, mediação passo a passo e recursos acessíveis.\n"
+    "13. FIDELIDADE ESTRITA AOS VETORES E PEIs DO ALUNO (ANTI-ALUCINAÇÃO): Baseie-se estritamente nos trechos recuperados do PEI e das "
+    "vivências do aluno. Nunca invente características, diagnósticos ou acordos pedagógicos que não constem no contexto fornecido."
 )
 
 
@@ -284,9 +290,10 @@ def gerar_resposta(
     else:
         resposta_bruta = _gerar_via_mock(prompt_final)
 
-    # 3. Guardrail de Saída: Assegura referências finais apenas quando solicitado
+    # 3. Guardrail de Saída: Bloqueia código na saída e assegura referências finais quando solicitado
     if aplicar_guardrails:
-        return garantir_referencias_finais(resposta_bruta, fontes, formato=formato_referencias)
+        resposta_auditada = auditar_resposta_ia(resposta_bruta)
+        return garantir_referencias_finais(resposta_auditada, fontes, formato=formato_referencias)
     return resposta_bruta
 
 

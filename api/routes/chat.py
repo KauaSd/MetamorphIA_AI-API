@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 from datetime import datetime, timezone
+import re
 import uuid
 from typing import Any, Literal, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 
 from arquivo_utils import (
     DOCX_MEDIA_TYPE,
@@ -42,13 +43,21 @@ from db_client import (
 )
 from guardrails import (
     MENSAGEM_RECUSA_ESCOPO,
+    auditar_resposta_ia,
+    detectar_pedido_programacao_ou_resposta_pronta,
     eh_pedido_explicitamente_fora_escopo,
     sanitizar_dados_sensiveis,
     validar_escopo_pedagogico,
 )
+from config import get_settings
 from llm_client import gerar_resposta_async
 from memoria.queries import buscar_documentos_referencia
+from memoria.student_vectors import (
+    buscar_contexto_vetorial_aluno,
+    indexar_contexto_aluno_pgvector,
+)
 from schemas import (
+    AnaliseEntradaTeste,
     AnexoItem,
     ChatRequest,
     ChatResponse,
@@ -60,6 +69,7 @@ from schemas import (
     MensagemItem,
     MetaBimestreItem,
 )
+from verificador_pertinencia import analisar_entrada_com_ia
 
 router = APIRouter(tags=["chat"])
 
@@ -114,14 +124,18 @@ _TERMOS_REVISAO_PEI = (
 
 
 def _detectar_pedido_revisao_pei(texto: str) -> bool:
+    if _eh_comando_documento_pei(texto):
+        return False
     t = (texto or "").strip().lower()
     if any(termo in t for termo in _TERMOS_REVISAO_PEI):
         return True
-    verbos_edicao = ("trocar", "alterar", "mudar", "modificar", "atualizar", "editar", "ajustar", "incluir", "remover", "substituir")
-    if "pei" in t and any(v in t for v in verbos_edicao):
+    radicais_edicao = ("troc", "alter", "mud", "modific", "atualiz", "edit", "ajust", "inclu", "remov", "substitu", "refa", "revis")
+    tem_verbo_edicao = any(r in t for r in radicais_edicao)
+    if "pei" in t and tem_verbo_edicao:
         return True
-    if any(v in t for v in verbos_edicao) and any(
-        alvo in t for alvo in ("resposta 1", "resposta 2", "resposta 3", "resposta 4", "a resposta", "parte 1", "parte 2", "parte 3", "parte 4")
+    if tem_verbo_edicao and (
+        re.search(r"\b(?:resposta|pergunta|parte|item|quest[aã]o|a|o|n[º°]?)\s*\d+\b", t)
+        or any(alvo in t for alvo in ("a resposta", "essa resposta", "seção"))
     ):
         return True
     return False
@@ -148,8 +162,12 @@ def _classificar_confirmacao_revisao_pei(texto: str) -> str:
     return "ajuste"
 
 
-def _exigir_pei_valido_aluno(aluno) -> None:
-    """Garante que o aluno possui PEI concluído e dentro da validade bimestral (60 dias) antes do chat."""
+def _exigir_pei_valido_aluno(
+    aluno,
+    usuario_autenticado: Optional[dict[str, Any]] = None,
+    permitir_revisao_pei: bool = False,
+) -> None:
+    """Garante que o aluno possui todos os PEIs das disciplinas do professor concluídos e dentro da validade (60 dias)."""
     if not aluno.pei_ativo:
         if aluno.pei_feito:
             raise HTTPException(
@@ -161,11 +179,100 @@ def _exigir_pei_valido_aluno(aluno) -> None:
             detail="É obrigatório concluir o PEI deste aluno antes de conversar com a IA.",
         )
 
+    if permitir_revisao_pei:
+        return
+
+    todos_concluidos = getattr(aluno, "todos_peis_concluidos", None)
+    pendentes = list(getattr(aluno, "disciplinas_pendentes", None) or [])
+    if todos_concluidos is None and usuario_autenticado is not None:
+        tags_jwt = usuario_autenticado.get("tags") or []
+        if tags_jwt:
+            from api.routes.dashboard_aluno import calcular_status_multi_pei_usuario
+
+            status_multi = calcular_status_multi_pei_usuario(aluno, tags_jwt)
+            todos_concluidos = status_multi["todos_concluidos"]
+            pendentes = status_multi["pendentes"]
+        else:
+            todos_concluidos = True
+
+    if todos_concluidos is False:
+        faltantes = ", ".join(pendentes) if pendentes else "suas disciplinas"
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Para conversar no chat deste aluno, conclua primeiro todos os PEIs das suas disciplinas. "
+                f"Pendentes: {faltantes}."
+            ),
+        )
+
+
+async def _executar_pos_processamento_chat_bg(
+    *,
+    id_aluno: int,
+    conversa_id: str,
+    aluno: Any,
+    msg_segura: str,
+    resposta_ia: str,
+    titulo_resumo: str,
+    historico_conversa: str,
+    anexos_recebidos: list[AnexoItem],
+    anexos_resposta: list[AnexoItem],
+    persistido_pelo_gateway: bool,
+    deve_atualizar_memoria: bool,
+    indexar_relato_vetor: bool,
+    token_jwt: Optional[str],
+) -> None:
+    """Executa persistência de turno, indexação no pgvector e síntese de perfil sem bloquear a resposta do chat."""
+    if not persistido_pelo_gateway:
+        try:
+            await registrar_turno_conversa_db(
+                id_aluno=id_aluno,
+                conversa_id=conversa_id,
+                mensagem_usuario=msg_segura,
+                resposta_ia=resposta_ia,
+                titulo=titulo_resumo,
+                anexos_usuario=[a.model_dump() for a in anexos_recebidos] if anexos_recebidos else None,
+                anexos_ia=[a.model_dump() for a in anexos_resposta] if anexos_resposta else None,
+                token=token_jwt,
+            )
+        except Exception:
+            pass
+
+    if indexar_relato_vetor and len(msg_segura.strip()) >= 15:
+        try:
+            nome_limpo, _ = sanitizar_dados_sensiveis(aluno.nome_aluno)
+            await indexar_contexto_aluno_pgvector(
+                id_aluno=id_aluno,
+                origem="relato_chat",
+                textos=[f"[Vivência / Relato sobre {nome_limpo}]: {msg_segura}"],
+                conversa_id=conversa_id,
+                token=token_jwt,
+            )
+        except Exception:
+            pass
+
+    if deve_atualizar_memoria:
+        try:
+            from api.routes.dashboard_aluno import gerar_contexto_sintetizado_aluno
+
+            trecho_para_sintese = (
+                f"{historico_conversa}Professor: {msg_segura}\nAssistente: {resposta_ia[:600]}"
+            )
+            await gerar_contexto_sintetizado_aluno(
+                aluno=aluno,
+                historico_conversas=trecho_para_sintese,
+                sincronizar_db=not persistido_pelo_gateway,
+                token=token_jwt,
+            )
+        except Exception:
+            pass
+
 
 @router.post("/alunos/{id_aluno}/chat", response_model=ChatResponse)
 async def post_chat(
     id_aluno: int,
     payload: ChatRequest,
+    background_tasks: BackgroundTasks,
     usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
 ) -> ChatResponse:
     validar_permissao_chat_usuario(usuario_autenticado)
@@ -180,13 +287,28 @@ async def post_chat(
     except Exception as exc:
         levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado na base de dados.")
 
-    _exigir_pei_valido_aluno(aluno)
-
     cid = payload.conversa_id
     if cid in ("string", "", "null", "None"):
         cid = None
     conversa_id = cid or str(uuid.uuid4())
     chave_pendente = (id_prof_token, id_aluno, conversa_id)
+
+    msg_bruta = (payload.mensagem or "").strip()
+    eh_fluxo_revisao_pei = bool(
+        not payload.anexos
+        and not payload.gerar_arquivo_atividade
+        and (
+            payload.modo_revisao_pei
+            or _PEDIDOS_REVISAO_PEI_PENDENTES.get(chave_pendente) is not None
+            or _detectar_pedido_revisao_pei(msg_bruta)
+            or _eh_comando_documento_pei(msg_bruta)
+        )
+    )
+    _exigir_pei_valido_aluno(
+        aluno,
+        usuario_autenticado,
+        permitir_revisao_pei=eh_fluxo_revisao_pei,
+    )
 
     anexos_recebidos = payload.anexos or []
     textos_anexos: list[str] = []
@@ -226,30 +348,97 @@ async def post_chat(
     eh_injection, alerta_injection = detectar_prompt_injection(mensagem_base)
     if eh_injection:
         return ChatResponse(resposta=alerta_injection, conversa_id=conversa_id)
+
+    eh_proibido, alerta_proibido = detectar_pedido_programacao_ou_resposta_pronta(mensagem_base)
+    if eh_proibido:
+        return ChatResponse(resposta=alerta_proibido, conversa_id=conversa_id)
+
     msg_segura, _ = sanitizar_dados_sensiveis(mensagem_base)
-
-    if payload.historico is not None:
-        mensagens_anteriores = payload.historico
-    elif cid:
-        try:
-            mensagens_anteriores = await obter_mensagens_conversa_db(
-                id_aluno=id_aluno, conversa_id=conversa_id, token=token_jwt
-            )
-        except Exception as exc:
-            levantar_http_de_erro_db(exc, msg_nao_encontrado="Conversa não encontrada.")
-    else:
-        mensagens_anteriores = []
-
-    historico_conversa = ""
-    eh_conversa_em_andamento = bool(mensagens_anteriores)
 
     if eh_pedido_explicitamente_fora_escopo(mensagem_base):
         return ChatResponse(resposta=MENSAGEM_RECUSA_ESCOPO, conversa_id=conversa_id)
 
+    # Paraleliza busca de histórico, vetores do aluno no pgvector e documentos DUA/WWC
+    async def _carregar_historico():
+        if payload.historico is not None:
+            return payload.historico
+        if cid:
+            return await obter_mensagens_conversa_db(
+                id_aluno=id_aluno, conversa_id=conversa_id, token=token_jwt
+            )
+        return []
+
+    async def _carregar_docs():
+        if payload.historico or cid:
+            return []
+        return await asyncio.to_thread(buscar_documentos_referencia, query=msg_segura, n_results=2)
+
+    try:
+        mensagens_anteriores, busca_vetorial, fontes_docs = await asyncio.gather(
+            _carregar_historico(),
+            buscar_contexto_vetorial_aluno(
+                id_aluno=id_aluno, query=msg_segura, top_k=6, token=token_jwt
+            ),
+            _carregar_docs(),
+        )
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado="Conversa não encontrada.")
+
+    trechos_vetoriais = list(busca_vetorial.get("trechos") or [])
+    disciplinas_pei_vetor = list(busca_vetorial.get("disciplinas_pei") or [])
+    melhor_similaridade_vetor = max(
+        (float(t.get("similaridade", 0.0)) for t in trechos_vetoriais),
+        default=0.0,
+    )
+
+    historico_conversa = ""
+    eh_conversa_em_andamento = bool(mensagens_anteriores)
+
     if not eh_conversa_em_andamento:
-        no_escopo, msg_escopo = validar_escopo_pedagogico(texto_para_validacao)
+        no_escopo, msg_escopo = validar_escopo_pedagogico(
+            texto_para_validacao,
+            nomes_contexto=[aluno.nome_aluno],
+            similaridade_vetorial=melhor_similaridade_vetor,
+        )
         if not no_escopo:
             return ChatResponse(resposta=msg_escopo, conversa_id=conversa_id)
+
+    # Modo Teste opcional (ou global via ENABLE_ANALYZER_AI): 1ª IA Analisadora com % de corte
+    settings = get_settings()
+    usar_analisador = bool(payload.modo_teste_analisador or settings.ENABLE_ANALYZER_AI)
+    analise_teste_resp: Optional[AnaliseEntradaTeste] = None
+    if usar_analisador and not anexos_recebidos and not pedido_pendente and not revisao_pei_pendente:
+        res_analise = await analisar_entrada_com_ia(
+            mensagem=msg_segura,
+            nome_aluno=aluno.nome_aluno,
+            neurodivergencia=aluno.neurodiv_aluno,
+            trechos_vetoriais=trechos_vetoriais,
+            disciplinas_pei=disciplinas_pei_vetor or list(getattr(aluno, "disciplinas_concluidas", []) or []),
+            limiar=payload.limiar_analisador,
+        )
+        analise_teste_resp = AnaliseEntradaTeste(
+            porcentagem=res_analise.porcentagem,
+            limiar=res_analise.limiar,
+            aprovado=res_analise.aprovado,
+            motivo=res_analise.motivo,
+            relacionado_ao_aluno_ou_pei=res_analise.relacionado_ao_aluno_ou_pei,
+            pede_resposta_pronta_ou_codigo=res_analise.pede_resposta_pronta_ou_codigo,
+            disciplina_identificada=res_analise.disciplina_identificada,
+            similaridade_pgvector=round(melhor_similaridade_vetor, 4),
+            chunks_utilizados=len(trechos_vetoriais),
+            latencia_analisador_ms=res_analise.latencia_ms,
+        )
+        if not res_analise.aprovado:
+            msg_bloqueio = (
+                f"Não foi possível processar esta solicitação para **{aluno.nome_aluno}** "
+                f"(aderência estimada: {res_analise.porcentagem:.0f}%, mínimo: {res_analise.limiar:.0f}%). "
+                f"{res_analise.motivo}"
+            )
+            return ChatResponse(
+                resposta=msg_bloqueio,
+                conversa_id=conversa_id,
+                analise_entrada=analise_teste_resp,
+            )
 
     if mensagens_anteriores:
         linhas_historico = []
@@ -261,18 +450,22 @@ async def post_chat(
             linhas_historico.append(f"{remetente}: {conteudo}")
         historico_conversa = "HISTÓRICO DESTA CONVERSA:\n" + "\n".join(linhas_historico) + "\n\n"
 
-    # Memória geral consolidada do aluno vinda exclusivamente de Aluno.perfil_ia na API-DB
+    # Contexto combinado: trechos do pgvector (todos os PEIs + vivências) + perfil consolidado
     perfil_contexto = aluno.perfil_ia or aluno.desc_aluno or ""
-    contexto_combinado = ""
+    blocos_contexto_aluno: list[str] = []
+    if disciplinas_pei_vetor or getattr(aluno, "disciplinas_concluidas", None):
+        lista_discs = disciplinas_pei_vetor or list(getattr(aluno, "disciplinas_concluidas", []))
+        blocos_contexto_aluno.append(f"PEIs CONCLUÍDOS DO ESTUDANTE: {', '.join(lista_discs)}")
+    if trechos_vetoriais:
+        linhas_vec = [
+            f"- [{t.get('origem', 'vetor')} | {t.get('disciplina') or 'Geral'} | sim={t.get('similaridade', 0)}]: {t.get('texto', '')}"
+            for t in trechos_vetoriais
+        ]
+        blocos_contexto_aluno.append("TRECHOS RECUPERADOS DO BANCO VETORIAL (pgvector) DO ALUNO:\n" + "\n".join(linhas_vec))
     if perfil_contexto:
         perfil_contexto, _ = sanitizar_dados_sensiveis(perfil_contexto)
-        contexto_combinado = f"MEMÓRIA E PERFIL CONSOLIDADO DO ALUNO (PEI + CONVERSAS):\n{perfil_contexto}"
-
-    fontes_docs = (
-        await asyncio.to_thread(buscar_documentos_referencia, query=msg_segura, n_results=2)
-        if not eh_conversa_em_andamento
-        else []
-    )
+        blocos_contexto_aluno.append(f"PERFIL CONSOLIDADO DO ALUNO:\n{perfil_contexto}")
+    contexto_combinado = "\n\n".join(blocos_contexto_aluno)
 
     if eh_conversa_em_andamento:
         instrucao_continuidade = (
@@ -311,6 +504,7 @@ async def post_chat(
         if decisao == "gerar_documento":
             from api.routes.dashboard_aluno import gerar_contexto_sintetizado_aluno
             from api.routes.pei import (
+                PERGUNTAS_GERAIS_MODELO,
                 formatar_texto_pei_completo,
                 gerar_respostas_gerais_pei,
                 montar_docx_pei,
@@ -393,8 +587,11 @@ async def post_chat(
                 pass
 
             resp_ok = (
-                f"Pronto! Gere e salvei o **novo PEI atualizado de {nome_aluno_limpo}** ({componente_rev}) "
-                f"com a alteração confirmada. Você já pode baixar o arquivo `.docx` abaixo ou acessá-lo no menu de PEIs."
+                f"Pronto! Gerei e salvei o **novo PEI atualizado de {nome_aluno_limpo}** ({componente_rev}) "
+                f"com a alteração confirmada.\n\n"
+                f"**Resumo das respostas atualizadas no documento:**\n"
+                + "\n".join(f"- **{PERGUNTAS_GERAIS_MODELO[k]}:** {v[:300]}" for k, v in respostas_gerais_int.items() if k in PERGUNTAS_GERAIS_MODELO)
+                + "\n\nVocê já pode baixar o arquivo `.docx` abaixo ou acessá-lo no menu de PEIs."
             )
             anexo_pei = AnexoItem(
                 name=arq_nome,
@@ -425,9 +622,10 @@ async def post_chat(
                 download_url=f"/alunos/{id_aluno}/pei/{novo_pei_id}/docx",
             )
 
-    # Fluxo 2: Pedido para alterar/trocar algo no PEI (ou ajuste da proposta pendente)
-    if not anexos_recebidos and (
+    # Fluxo 2: Pedido para alterar/trocar algo no PEI (ou ajuste da proposta pendente / modo_revisao_pei)
+    if not anexos_recebidos and not _eh_comando_documento_pei(msg_segura) and (
         _detectar_pedido_revisao_pei(msg_segura)
+        or (payload.modo_revisao_pei and not _detectar_pedido_atividade_conversa(msg_segura))
         or (isinstance(revisao_pei_pendente, dict) and _classificar_confirmacao_revisao_pei(msg_segura) == "ajuste")
     ):
         pei_anterior_txt = ""
@@ -450,18 +648,26 @@ async def post_chat(
             except Exception:
                 pass
 
-        componente_rev = "Língua Portuguesa"
+        componente_rev = ""
         for tag_prof in (usuario_autenticado.get("tags") or []):
             if str(tag_prof).lower() in msg_segura.lower():
                 componente_rev = str(tag_prof)
                 break
+        if not componente_rev:
+            texto_busca_comp = f"{historico_conversa}\n{pei_anterior_txt[:1000]}".lower()
+            for tag_prof in (usuario_autenticado.get("tags") or []):
+                if str(tag_prof).lower() in texto_busca_comp:
+                    componente_rev = str(tag_prof)
+                    break
+        if not componente_rev:
+            componente_rev = "Língua Portuguesa"
 
         prompt_revisao = (
-            f"O professor deseja alterar o PEI de {nome_aluno_limpo} ({aluno.neurodiv_aluno}, {ano_turma}).\n"
+            f"O professor deseja alterar o PEI de {nome_aluno_limpo} ({aluno.neurodiv_aluno}, {ano_turma}) — Componente: {componente_rev}.\n"
             f"Perfil/Memória atual do aluno:\n{perfil_contexto[:1500]}\n\n"
             f"PEI atual (trecho):\n{pei_anterior_txt[:2000] or 'Não disponível'}\n\n"
             f"Solicitação do professor: {msg_segura}\n\n"
-            "Apresente de forma clara e objetiva:\n"
+            "Apresente de forma clara e objetiva (sem tabelas Markdown, usando tópicos simples):\n"
             "1. O que será alterado no PEI.\n"
             "2. A nova proposta de redação/estratégia para essa parte do PEI.\n"
             "Ao final, oriente o professor a digitar \"documento\" quando quiser gerar o novo PEI em .docx, ou enviar mais ajustes."
@@ -661,6 +867,25 @@ async def post_chat(
     download_url_gerado: str | None = None
     formato_arquivo_gerado: str | None = None
 
+    # Bloqueia conversa livre / adaptação de atividades enquanto houver PEIs pendentes do professor
+    if not getattr(aluno, "todos_peis_concluidos", True) and not pediu_documento_pei:
+        from api.routes.dashboard_aluno import calcular_status_multi_pei_usuario
+
+        status_multi = calcular_status_multi_pei_usuario(
+            aluno=aluno,
+            tags_usuario=usuario_autenticado.get("tags") or [],
+        )
+        if not status_multi["todos_concluidos"]:
+            faltantes = ", ".join(status_multi["pendentes"])
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "No momento você pode apenas revisar ou ajustar as respostas do PEI já concluído "
+                    "(ou digitar 'Documento' para baixar o .docx). "
+                    f"Para conversar ou adaptar atividades para o estudante, conclua antes os PEIs pendentes: {faltantes}."
+                ),
+            )
+
     if pediu_documento_pei:
         from api.routes.pei import montar_docx_pei
 
@@ -706,6 +931,7 @@ async def post_chat(
             fontes_referencia=fontes_docs,
             formato_referencias="discreto",
         )
+        resposta_ia = auditar_resposta_ia(resposta_ia)
 
     if deve_gerar_arquivo_atividade and not pediu_documento_pei:
         atividade_id_gerada = str(uuid.uuid4())
@@ -767,52 +993,33 @@ async def post_chat(
         titulo_bruto = msg_segura
     titulo_resumo, _ = sanitizar_dados_sensiveis((titulo_bruto or "")[:40])
 
-    if not payload.persistido_pelo_gateway:
-        try:
-            await registrar_turno_conversa_db(
-                id_aluno=id_aluno,
-                conversa_id=conversa_id,
-                mensagem_usuario=msg_segura,
-                resposta_ia=resposta_ia,
-                titulo=titulo_resumo,
-                anexos_usuario=[a.model_dump() for a in anexos_recebidos] if anexos_recebidos else None,
-                anexos_ia=[a.model_dump() for a in anexos_resposta] if anexos_resposta else None,
-                token=token_jwt,
-            )
-        except Exception:
-            pass
+    from api.routes.dashboard_aluno import deve_atualizar_memoria_conversa
 
-    from api.routes.dashboard_aluno import (
-        deve_atualizar_memoria_conversa,
-        gerar_contexto_sintetizado_aluno,
-    )
-
-    perfil_atualizado: str | None = None
-    indicadores_gerados: list[IndicadorDesenvolvimentoItem] | None = None
-    metas_geradas: list[MetaBimestreItem] | None = None
-    if not pediu_documento_pei and deve_atualizar_memoria_conversa(
+    deve_mem = not pediu_documento_pei and deve_atualizar_memoria_conversa(
         mensagem_usuario=msg_segura,
         resposta_ia=resposta_ia,
         gerou_atividade_adaptada=deve_gerar_arquivo_atividade,
-    ):
-        trecho_para_sintese = (
-            f"{historico_conversa}Professor: {msg_segura}\nAssistente: {resposta_ia[:600]}"
-        )
-        perfil_atualizado, _, inds_raw, metas_raw = await gerar_contexto_sintetizado_aluno(
-            aluno=aluno,
-            historico_conversas=trecho_para_sintese,
-            sincronizar_db=not payload.persistido_pelo_gateway,
-            token=token_jwt,
-        )
-        indicadores_gerados = [IndicadorDesenvolvimentoItem(**i) for i in inds_raw]
-        metas_geradas = [MetaBimestreItem(**m) for m in metas_raw]
+    )
+    background_tasks.add_task(
+        _executar_pos_processamento_chat_bg,
+        id_aluno=id_aluno,
+        conversa_id=conversa_id,
+        aluno=aluno,
+        msg_segura=msg_segura,
+        resposta_ia=resposta_ia,
+        titulo_resumo=titulo_resumo,
+        historico_conversa=historico_conversa,
+        anexos_recebidos=anexos_recebidos,
+        anexos_resposta=anexos_resposta,
+        persistido_pelo_gateway=bool(payload.persistido_pelo_gateway),
+        deve_atualizar_memoria=deve_mem,
+        indexar_relato_vetor=not pediu_documento_pei,
+        token_jwt=token_jwt,
+    )
 
     return ChatResponse(
         resposta=resposta_ia,
         conversa_id=conversa_id,
-        perfil_atualizado=perfil_atualizado,
-        indicadores_desenvolvimento=indicadores_gerados,
-        metas_bimestre=metas_geradas,
         anexos=anexos_resposta or None,
         atividade_id=atividade_id_gerada,
         arquivo_nome=arquivo_nome_gerado,
@@ -822,6 +1029,60 @@ async def post_chat(
         modo_adaptacao_usado=modo_adaptacao_usado,
         template_usado=template_usado_id,
         formato_arquivo=formato_arquivo_gerado,
+        analise_entrada=analise_teste_resp,
+    )
+
+
+@router.post("/alunos/{id_aluno}/chat/testar-analisador", response_model=ChatResponse)
+async def testar_analisador_chat(
+    id_aluno: int,
+    payload: ChatRequest,
+    usuario_autenticado: dict[str, Any] = Depends(verificar_token_jwt),
+) -> ChatResponse:
+    """Modo Teste: executa a 1ª IA Analisadora contra o pgvector do aluno sem persistir mensagens."""
+    validar_permissao_chat_usuario(usuario_autenticado)
+    token_jwt = usuario_autenticado.get("_raw_token")
+    try:
+        aluno = await obter_aluno(id_aluno, token=token_jwt)
+    except Exception as exc:
+        levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado na base de dados.")
+
+    msg_limpa, _ = sanitizar_dados_sensiveis((payload.mensagem or "").strip())
+    busca_vetorial = await buscar_contexto_vetorial_aluno(
+        id_aluno=id_aluno, query=msg_limpa, top_k=6, token=token_jwt
+    )
+    trechos_vetoriais = list(busca_vetorial.get("trechos") or [])
+    disciplinas_pei = list(busca_vetorial.get("disciplinas_pei") or [])
+    melhor_sim = max((float(t.get("similaridade", 0.0)) for t in trechos_vetoriais), default=0.0)
+
+    res = await analisar_entrada_com_ia(
+        mensagem=msg_limpa,
+        nome_aluno=aluno.nome_aluno,
+        neurodivergencia=aluno.neurodiv_aluno,
+        trechos_vetoriais=trechos_vetoriais,
+        disciplinas_pei=disciplinas_pei or list(getattr(aluno, "disciplinas_concluidas", []) or []),
+        limiar=payload.limiar_analisador,
+    )
+    analise = AnaliseEntradaTeste(
+        porcentagem=res.porcentagem,
+        limiar=res.limiar,
+        aprovado=res.aprovado,
+        motivo=res.motivo,
+        relacionado_ao_aluno_ou_pei=res.relacionado_ao_aluno_ou_pei,
+        pede_resposta_pronta_ou_codigo=res.pede_resposta_pronta_ou_codigo,
+        disciplina_identificada=res.disciplina_identificada,
+        similaridade_pgvector=round(melhor_sim, 4),
+        chunks_utilizados=len(trechos_vetoriais),
+        latencia_analisador_ms=res.latencia_ms,
+    )
+    return ChatResponse(
+        resposta=(
+            f"[MODO TESTE] Aprovado ({res.porcentagem:.0f}% >= {res.limiar:.0f}%): {res.motivo}"
+            if res.aprovado
+            else f"[MODO TESTE] Bloqueado ({res.porcentagem:.0f}% < {res.limiar:.0f}%): {res.motivo}"
+        ),
+        conversa_id=payload.conversa_id or str(uuid.uuid4()),
+        analise_entrada=analise,
     )
 
 

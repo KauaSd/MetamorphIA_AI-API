@@ -123,6 +123,31 @@ _MAPA_CATALOGO_POR_CHAVE: dict[str, dict[str, str]] = {
 }
 
 
+def calcular_status_multi_pei_usuario(
+    aluno: Any,
+    tags_usuario: list[Any],
+    disciplina_recem_concluida: Optional[str] = None,
+) -> dict[str, Any]:
+    """Calcula se todas as disciplinas do professor possuem PEI concluído para o aluno."""
+    tags = [str(t).strip() for t in (tags_usuario or []) if str(t).strip()]
+    chaves_concluidas = {
+        _normalizar_chave_disciplina(str(r.get("disciplina") or ""))
+        for r in (getattr(aluno, "peis_disciplinas", None) or [])
+        if r.get("status") == "concluido" and r.get("disciplina")
+    }
+    if disciplina_recem_concluida and disciplina_recem_concluida.strip():
+        chaves_concluidas.add(_normalizar_chave_disciplina(disciplina_recem_concluida))
+
+    pei_ativo = bool(getattr(aluno, "pei_ativo", False)) or bool(disciplina_recem_concluida)
+    if not tags:
+        return {"todos_concluidos": pei_ativo, "pendentes": []}
+
+    pendentes = [
+        tag for tag in tags if not pei_ativo or _normalizar_chave_disciplina(tag) not in chaves_concluidas
+    ]
+    return {"todos_concluidos": len(pendentes) == 0 and pei_ativo, "pendentes": pendentes}
+
+
 def _slug_disciplina(nome: str) -> str:
     item = _MAPA_CATALOGO_POR_CHAVE.get(_normalizar_chave_disciplina(nome))
     if item:
@@ -453,6 +478,12 @@ async def get_aluno_dashboard(
     if atrasado and status_geral != "CONCLUIDO":
         status_geral = "ATRASADO"
 
+    pendentes_disc = [d.disciplina for d in disciplinas_items if d.status != "concluido"]
+    todos_concluidos_disc = (
+        (len(pendentes_disc) == 0 and pei_gerado)
+        if total_disc > 0
+        else pei_gerado
+    )
     peis_por_disciplina = PeisPorDisciplinaResumo(
         status_geral=status_geral,
         concluidos=concluidos_disc,
@@ -461,11 +492,17 @@ async def get_aluno_dashboard(
         prazo_expirado=prazo_expirado,
         ultimo_envio=ultimo_envio_str,
         proximo_periodo=proximo_periodo_str,
+        todos_concluidos=todos_concluidos_disc,
+        pendentes=pendentes_disc,
         disciplinas=disciplinas_items,
     )
 
     indicadores = _normalizar_indicadores(aluno.indicadores_desenvolvimento)
-    metas = _normalizar_metas(aluno.metas_bimestre, aluno.neurodiv_aluno, pei_gerado)
+    metas = (
+        _normalizar_metas(aluno.metas_bimestre, aluno.neurodiv_aluno, pei_gerado)
+        if todos_concluidos_disc
+        else []
+    )
 
     return AlunoDashboardResponse(
         id_aluno=aluno.id_aluno,
@@ -639,13 +676,14 @@ Responda APENAS com um JSON válido, sem markdown e sem explicações extras, no
     {{"id": "engajamento", "nivel": 4}}
   ],
   "metas_bimestre": [
-    {{"id": "m1", "titulo": "Título curto da meta 1", "status": "a_iniciar"}},
-    {{"id": "m2", "titulo": "Título curto da meta 2", "status": "a_iniciar"}},
-    {{"id": "m3", "titulo": "Título curto da meta 3", "status": "a_iniciar"}}
+    {{"id": "m1", "titulo": "<meta pedagógica concreta 1>", "status": "a_iniciar"}},
+    {{"id": "m2", "titulo": "<meta pedagógica concreta 2>", "status": "a_iniciar"}},
+    {{"id": "m3", "titulo": "<meta pedagógica concreta 3>", "status": "a_iniciar"}}
   ]
 }}
 Regras:
 - "nivel" deve ser inteiro de 1 a 5 (1=muito baixo/precisa de muito apoio, 3=intermediário/com pistas, 5=alto/autônomo).
+- Redija 3 metas pedagógicas reais e específicas com base no PEI e na neurodivergência do estudante. PROIBIDO usar placeholders como "Título curto da meta" ou "<meta...>".
 {regra_status_metas}
 - Neurodivergência: {aluno.neurodiv_aluno}
 - Memória consolidada (Perfil IA):
@@ -672,10 +710,15 @@ Regras:
                 dados.get("metas_bimestre"), aluno.neurodiv_aluno, True
             )
         ]
+        tem_placeholder = any(
+            "titulo curto da meta" in m.get("titulo", "").lower().replace("í", "i")
+            or "<meta" in m.get("titulo", "").lower()
+            for m in metas
+        )
         if sem_conversas:
             for m in metas:
                 m["status"] = "a_iniciar"
-        if inds and metas:
+        if inds and metas and not tem_placeholder:
             return inds, metas
     except Exception:
         pass

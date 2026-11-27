@@ -7,6 +7,7 @@ import glob
 import io
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -32,6 +33,7 @@ from db_client import (
 from guardrails import sanitizar_dados_sensiveis
 from llm_client import gerar_resposta
 from memoria.queries import buscar_documentos_referencia
+from memoria.student_vectors import dividir_texto_pei_em_chunks, indexar_contexto_aluno_pgvector
 from schemas import (
     IndicadorDesenvolvimentoItem,
     MetaBimestreItem,
@@ -194,6 +196,44 @@ def _obter_contexto_consolidado_aluno(
     return "\n".join(partes).strip()
 
 
+_NOMES_COMPONENTES_CURRICULARES: dict[str, str] = {
+    "matematica": "Matemática",
+    "portugues": "Língua Portuguesa",
+    "l_portuguesa": "Língua Portuguesa",
+    "lingua_portuguesa": "Língua Portuguesa",
+    "ciencias": "Ciências",
+    "artes": "Arte",
+    "arte": "Arte",
+    "historia": "História",
+    "geografia": "Geografia",
+    "ingles": "Língua Inglesa",
+    "l_inglesa": "Língua Inglesa",
+    "lingua_inglesa": "Língua Inglesa",
+    "ed_fisica": "Educação Física",
+    "ed._fisica": "Educação Física",
+    "educacao_fisica": "Educação Física",
+    "fisica": "Física",
+    "quimica": "Química",
+    "biologia": "Biologia",
+    "filosofia": "Filosofia",
+    "sociologia": "Sociologia",
+    "ensino_religioso": "Ensino Religioso",
+}
+
+
+def _normalizar_nome_componente(componente: Optional[str]) -> str:
+    bruto = (componente or "").strip()
+    if not bruto:
+        return "Língua Portuguesa"
+    chave = (
+        unicodedata.normalize("NFKD", bruto.lower())
+        .encode("ascii", "ignore")
+        .decode("ascii")
+    )
+    chave = re.sub(r"[\s.]+", "_", chave).strip("_")
+    return _NOMES_COMPONENTES_CURRICULARES.get(chave, bruto)
+
+
 def _opcoes_padrao_contextualizadas(
     nome_aluno: str,
     neurodivergencia: str,
@@ -211,22 +251,22 @@ def _opcoes_padrao_contextualizadas(
 
     opcoes_por_sub: dict[str, list[str]] = {
         "1.1": [
-            f"Habilidades consolidadas: {nome_aluno} compreende comandos curtos e realiza atividades apoiadas em recursos visuais e materiais concretos ({neurodivergencia}).",
-            f"Em desenvolvimento: participa das tarefas de {componente_curricular} quando fragmentadas em etapas menores, mantendo o foco por períodos curtos.",
-            f"Com mediação: realiza registros escritos e atividades abstratas de {componente_curricular} com apoio individual e exemplos concretos.",
-            f"Autonomia funcional: expressa compreensão oralmente ou por apontamento visual, necessitando de suporte apenas na organização sequencial da tarefa.",
+            f"Habilidades consolidadas: {nome_aluno} resolve situações-problema de {componente_curricular} compatíveis com o {ano_escolar} com autonomia e bom raciocínio lógico.",
+            f"Aprofundamento por interesse: demonstra facilidade em reconhecer padrões e engaja-se com maior profundidade quando {componente_curricular} se conecta a temas de seu interesse.",
+            f"Em desenvolvimento: participa das tarefas de {componente_curricular} quando organizadas em etapas claras e sequenciais.",
+            f"Com mediação pontual: realiza registros e atividades de {componente_curricular} com enunciados objetivos e exemplos estruturados.",
         ],
         "1.2": [
-            f"Simplificar os enunciados de {componente_curricular} e dividir cada habilidade do {periodo_bimestre}º bimestre em pequenas etapas sequenciais.",
-            f"Aumentar o tempo de realização das atividades em sala e reduzir a quantidade de itens por folha, sem retirar o conteúdo curricular da turma.",
-            f"Utilizar recursos visuais e materiais concretos para representar os conceitos essenciais de {componente_curricular} previstos no Currículo Paulista.",
-            f"Priorizar as habilidades estruturantes do {ano_escolar} com instruções diretas e verificação passo a passo.",
+            f"Organizar os enunciados de {componente_curricular} de forma objetiva e dividir as tarefas do {periodo_bimestre}º bimestre em etapas sequenciais claras.",
+            f"Ajustar a extensão das atividades (menos itens repetitivos, mantendo o nível conceitual do {ano_escolar}) e oferecer tempo flexível quando necessário.",
+            f"Conectar as habilidades essenciais de {componente_curricular} do Currículo Paulista a situações práticas, padrões lógicos e temas de interesse do estudante.",
+            f"Priorizar as habilidades estruturantes do {ano_escolar} com critérios explícitos de resolução passo a passo.",
         ],
         "1.3": [
-            f"Com uso de materiais adaptados, apoio visual passo a passo e linguagem clara e objetiva nas aulas de {componente_curricular}.",
-            f"Por meio de recursos de acessibilidade e tecnologia assistiva (tablet/computador ou pranchas visuais) aliados ao suporte do professor regente.",
-            f"Articulando o planejamento de {componente_curricular} com o professor especializado do AEE para pré-ensino e reforço das habilidades do bimestre.",
-            f"Combinando adaptação de material impresso (fonte ampliada e destaque visual) com mediação individual nos momentos de maior exigência cognitiva.",
+            f"Com uso de roteiros estruturados, apoio visual passo a passo e linguagem direta e objetiva nas aulas de {componente_curricular}.",
+            f"Por meio de recursos digitais, simuladores interativos ou esquemas gráficos aliados à mediação do professor regente.",
+            f"Articulando o planejamento de {componente_curricular} com o professor especializado do AEE, quando houver, para alinhamento das estratégias do bimestre.",
+            f"Combinando atividades impressas com organização visual limpa e mediação pontual nos momentos de transição ou maior abstração.",
         ],
         "2.1": [
             f"Explicar o conteúdo de {componente_curricular} em partes menores, utilizando exemplos concretos e situações do cotidiano do estudante.",
@@ -241,22 +281,22 @@ def _opcoes_padrao_contextualizadas(
             "Ajustar a forma de participação e resposta do estudante (permitindo resposta oral, por pictogramas, prática ou digital).",
         ],
         "2.3": [
-            "Disponibilizar material com fonte acessível, espaçamento ampliado, alto contraste e organização visual limpa.",
-            "Utilizar figuras, esquemas visuais, pictogramas e organizadores gráficos para apoiar a compreensão em sala.",
-            "Permitir o uso de tablet ou computador para consulta e registro das respostas nas aulas.",
-            "Garantir adequação ambiental e sensorial (assento estratégico, abafadores de ruído quando necessário e tecnologias assistivas).",
+            "Utilizar esquemas visuais passo a passo, roteiros de aula e organizadores gráficos para dar previsibilidade.",
+            "Apresentar enunciados limpos, objetivos e com destaque visual apenas nos comandos principais da tarefa.",
+            "Permitir o uso de computador, tablet ou simuladores interativos (como PhET) para experimentação e registro.",
+            "Garantir adequação sensorial e previsibilidade do ambiente (assento estratégico, pausa programada e abafadores se necessário).",
         ],
         "3.1": [
             "Observação diária sistematizada no caderno do professor combinada com portfólio das atividades adaptadas do estudante.",
-            "Avaliações práticas e provas adaptadas com apoio visual, priorizando a evolução do estudante em relação a ele mesmo.",
+            "Avaliações práticas e provas estruturadas com apoio visual, priorizando a evolução do estudante em relação a ele mesmo.",
             "Lista de verificação (checklist) de habilidades do bimestre e rubricas com critérios claros e graduados de aprendizagem.",
-            "Conversas orientadas (avaliação oral), produções visuais/áudio e autoavaliação mediada com apoio visual (cores/ícones).",
+            "Conversas orientadas (avaliação oral), produções visuais/práticas e autoavaliação mediada com apoio visual.",
         ],
         "4.1": [
-            f"Vídeos: animações curtas e vídeos com passo a passo visual e linguagem simples sobre os temas de {componente_curricular}.",
-            f"Livros: materiais paradidáticos com linguagem acessível, histórias curtas ilustradas e livros em formato ampliado/digital sobre o tema estudado.",
-            f"Jogos: jogos de memória, associação (imagem–palavra / causa–efeito), quebra-cabeças e jogos digitais educativos de {componente_curricular}.",
-            "Atividades e exercícios: sequências didáticas curtas, atividades manipulativas com materiais concretos e exercícios multissensoriais de ligar, ordenar e montar.",
+            f"Vídeos: vídeos educativos curtos com narração objetiva e esquema passo a passo sobre {componente_curricular} ({ano_escolar}), buscar por \"{componente_curricular} {ano_escolar} explicação passo a passo com apoio visual\".",
+            f"Simulações e experimentos: simuladores interativos (como PhET) ou experimentos práticos com medidas conectando {componente_curricular} a interesses do aluno ({ano_escolar}), buscar por \"simulador PhET {componente_curricular} {ano_escolar} experimento prático\".",
+            f"Jogos: jogos estruturados de lógica, padrões e sequências com regras claras e previsíveis (individual ou com mediador), buscar por \"jogo lógico padrões {componente_curricular} {ano_escolar} estruturado\".",
+            f"Atividades: sequências didáticas curtas em etapas graduais com rotina previsível e esquema visual de resolução, buscar por \"atividade {componente_curricular} {ano_escolar} esquema visual passo a passo\".",
         ],
     }
 
@@ -322,7 +362,10 @@ def gerar_roteiro_pei_inicial(
             f"{secao_curriculo}\n"
             f"Para cada subpergunta abaixo, gere EXATAMENTE 4 possíveis respostas curtas, práticas e ALTAMENTE PERSONALIZADAS para este estudante específico.\n"
             f"REGRAS DE PERSONALIZAÇÃO OBRIGATÓRIAS:\n"
-            f"- Baseie TODAS as opções nos interesses, pontos fortes e dificuldades descritos no contexto do estudante, usando linguagem pedagógica profissional.\n"
+            f"- Baseie TODAS as opções nos interesses, pontos fortes, ritmo de aprendizagem e dificuldades descritos no contexto do estudante, usando linguagem pedagógica profissional.\n"
+            f"- ADERÊNCIA ESTRITA À CONDIÇÃO REAL ({neurodivergencia}): NUNCA sugira adaptações de outra deficiência que o estudante NÃO possui (ex.: NÃO sugira 'alto contraste', 'fonte grande/ampliada' ou 'Braille' para estudante com TEA/TDAH sem baixa visão; para TEA priorize previsibilidade, esquema visual passo a passo, instruções objetivas e redução de sobrecarga).\n"
+            f"- SÉRIE/ANO REAL: Use EXCLUSIVAMENTE a série/ano '{ano_escolar}' informada acima. PROIBIDO inventar '1º ano' ou outra série diferente.\n"
+            f"- RITMO E INTERESSES: Incorpore explicitamente o ritmo de aprendizagem (atividades curtas, em etapas graduais e com rotina previsível) e os interesses do estudante (ex.: se houver interesse em Física, Ciências ou lógica, inclua simuladores como PhET ou experimentos simples com medidas ligados a {componente_curricular}).\n"
             f"- PROIBIDO copiar ou repetir literalmente frases ou palavras brutas escritas pelo professor na descrição inicial (nunca cole o texto do professor entre parênteses).\n"
             f"- PROIBIDO gerar frases genéricas de livro didático que serviriam para qualquer aluno.\n"
             f"- Siga os critérios em vermelho do Roteiro MetamorphIA:\n"
@@ -333,7 +376,7 @@ def gerar_roteiro_pei_inicial(
             f"- '2.2': Subpergunta 'Quais intervenções pedagógicas você utilizará para que o estudante consiga participar das aulas?' (Critérios: apoio individual em atividades complexas, adaptação de quantidade, adaptação de complexidade, ajuste da forma de participação oral/pictograma/escrita/digital).\n"
             f"- '2.3': Subpergunta 'Quais recursos de acessibilidade você utilizará para que o estudante consiga participar das aulas?' (Critérios: material ampliado/contrastes/fontes acessíveis, figuras/esquemas/pictogramas/CAA, uso de tablet/computador, fones/abafadores/mobiliário adaptado, tecnologias assistivas).\n"
             f"- '3.1': Subpergunta 'Como você vai avaliar o estudante respeitando seu ritmo, suas necessidades e suas formas de expressão?' (Critérios: observação diária, portfólio, avaliações práticas, checklist de habilidades, registro fotográfico, autoavaliação com apoio visual, conversas orientadas, produções em vídeo/áudio/desenho, rubricas; avaliando o progresso do aluno em relação a ele mesmo).\n"
-            f"- '4.1': Subpergunta 'Quais vídeos, livros, jogos, exercícios ou outras atividades você indicará para apoiar e fortalecer o aprendizado do estudante?' (Critérios: 1 opção de Vídeos, 1 opção de Livros, 1 opção de Jogos e 1 opção de Atividades/exercícios adaptados ao componente curricular e ao aluno. REGRA CRÍTICA: NUNCA invente títulos fictícios de vídeos do YouTube, livros, canais, autores ou links; descreva apenas o formato/tipo do recurso, critérios de acessibilidade e termos/temas de busca sem nomes inventados entre aspas).\n\n"
+            f"- '4.1': Subpergunta 'Quais vídeos, livros, jogos, exercícios ou outras atividades você indicará para apoiar e fortalecer o aprendizado do estudante?' (Critérios: 1 opção de Vídeos, 1 opção de Livros/Simulações/Experimentos conectados aos interesses do aluno, 1 opção de Jogos estruturados e 1 opção de Atividades curtas/passo a passo alinhadas ao ritmo de aprendizagem. REGRA CRÍTICA: NUNCA invente títulos fictícios de vídeos do YouTube, livros, canais, autores ou links; em termos de busca, use a série real '{ano_escolar}' e evite termos genéricos como 'acessível' ou 'adaptado' quando não se tratar de deficiência visual/auditiva — prefira 'estruturado', 'passo a passo', 'com apoio visual', 'simulador PhET' ou 'experimento prático').\n\n"
             f"Retorne APENAS um objeto JSON válido com a chave 'conteudo_previsto' (string descrevendo o conteúdo previsto do Currículo Paulista "
             f"para este ano/bimestre em {componente_curricular}) e a chave 'subperguntas' contendo as chaves '1.1', '1.2', '1.3', '2.1', '2.2', '2.3', '3.1', '4.1', "
             f"onde cada chave possui uma lista de EXATAMENTE 4 strings."
@@ -402,13 +445,13 @@ def gerar_roteiro_pei_inicial(
             subperguntas=[
                 PeiSubperguntaItem(
                     id_subpergunta="2.1",
-                    pergunta="Quais estratégias pedagógicas você utilizará para que o estudante consiga participar das aulas?",
+                    pergunta="Quais estratégias pedagógicas (como apresentar, explicar e organizar a aula) você utilizará?",
                     opcoes=opcoes_por_sub["2.1"][:4],
                     alternativas_fixas=["Não irei utilizar estratégias pedagógicas", "Outros"],
                 ),
                 PeiSubperguntaItem(
                     id_subpergunta="2.2",
-                    pergunta="Quais intervenções pedagógicas você utilizará para que o estudante consiga participar das aulas?",
+                    pergunta="Quais intervenções pedagógicas (mediação direta, ajustes de tarefa ou forma de resposta) você aplicará durante a atividade?",
                     opcoes=opcoes_por_sub["2.2"][:4],
                     alternativas_fixas=["Não irei utilizar intervenções pedagógicas", "Outros"],
                 ),
@@ -600,12 +643,12 @@ def gerar_respostas_gerais_pei(
             f"Estudante: {nome_aluno} | Idade: {idade_aluno or 'Não informada'} | Neurodivergência: {neurodivergencia}\n"
             f"Componente Curricular: {componente_curricular} | Ano: {ano_escolar} | Bimestre: {periodo_bimestre}º\n"
             f"Contexto do Estudante: {contexto_aluno}\n\n"
-            f"DIRETRIZ DE CENTRALIDADE NAS RESPOSTAS DO PROFESSOR:\n"
-            f"- Una todas as respostas do professor abaixo e use-as como o eixo central de cada resposta geral.\n"
-            f"- Você pode complementar com estratégias ou desdobramentos pedagógicos que não foram citados explicitamente, "
-            f"desde que estejam diretamente alinhados e centralizados no que o professor respondeu e no perfil do estudante.\n"
-            f"- NÃO fuja do que o professor pediu, NÃO contradiga escolhas dele (ex: se indicou que não usará algo) e "
-            f"NÃO despeje listas genéricas de possíveis opções que não tenham relação direta com as respostas enviadas.\n"
+            f"DIRETRIZ DE CENTRALIDADE E FIDELIDADE ESTRITA ÀS RESPOSTAS DO PROFESSOR:\n"
+            f"- Baseie cada resposta geral ESTRITAMENTE no que o professor selecionou/respondeu abaixo e no contexto real do estudante.\n"
+            f"- PROIBIDO inventar, acrescentar ou presumir adaptações, recursos, conteúdos ou série/ano que NÃO foram escolhidos pelo professor (ex.: se o professor NÃO escolheu alto contraste, fonte ampliada, abafadores/protetores auriculares, jogos, livros, planilha diária ou mediação em grupo, é PROIBIDO incluir esses itens).\n"
+            f"- SÉRIE/ANO E CONTEÚDOS: Use EXCLUSIVAMENTE a série/ano '{ano_escolar}' informada. PROIBIDO inventar '1º ano' ou listar conteúdos específicos (ex.: números de 0 a 20, adição/subtração) que não estejam nas respostas do professor ou nos trechos do Currículo Paulista recuperados para '{ano_escolar}'.\n"
+            f"- SEÇÃO 1: Inclua explicitamente o que o estudante já consegue fazer (Pergunta 1.1) abrindo a resposta da Seção 1.\n"
+            f"- NÃO fuja do que o professor pediu, NÃO contradiga escolhas dele (ex: se indicou que não usará algo) e NÃO despeje listas genéricas.\n"
             f"- Gere a resposta APENAS para cada uma das 4 Perguntas Gerais (NÃO repita as subperguntas como perguntas no texto final).\n"
             f"- FORMATAÇÃO: escreva em texto corrido e tópicos simples ('• '). É PROIBIDO usar tabelas (Markdown ou quadros), marcações Markdown ('**', '###') e é PROIBIDO incluir citações de fonte ('*Fonte base:...*', 'Fonte:', 'Referências:').\n\n"
             f"Pergunta Geral 1: {PERGUNTAS_GERAIS_MODELO[1]}\n"
@@ -945,6 +988,7 @@ async def criar_pei_inicial(
     nome_aluno_limpo, _ = sanitizar_dados_sensiveis(aluno.nome_aluno)
     neuro_limpa, _ = sanitizar_dados_sensiveis(aluno.neurodiv_aluno)
     ano_escolar_efetivo = await _resolver_ano_escolar_turma(aluno, req.ano_escolar, token_jwt)
+    componente_normalizado = _normalizar_nome_componente(req.componente_curricular)
 
     return await asyncio.to_thread(
         gerar_roteiro_pei_inicial,
@@ -952,7 +996,7 @@ async def criar_pei_inicial(
         nome_aluno=nome_aluno_limpo,
         neurodivergencia=neuro_limpa,
         contexto_aluno=contexto_aluno,
-        componente_curricular=req.componente_curricular or "Língua Portuguesa",
+        componente_curricular=componente_normalizado,
         ano_escolar=ano_escolar_efetivo,
         periodo_bimestre=req.periodo_bimestre or 1,
         indice_subpergunta=req.indice_subpergunta,
@@ -979,7 +1023,7 @@ async def _processar_criacao_pei(
         descricao_enviada=payload.descricao_aluno,
     )
 
-    componente, _ = sanitizar_dados_sensiveis(payload.componente_curricular or "Língua Portuguesa")
+    componente, _ = sanitizar_dados_sensiveis(_normalizar_nome_componente(payload.componente_curricular))
     ano_escolar_efetivo = await _resolver_ano_escolar_turma(aluno, payload.ano_escolar, token_jwt)
     ano_escolar, _ = sanitizar_dados_sensiveis(ano_escolar_efetivo)
     bimestre = payload.periodo_bimestre if payload.periodo_bimestre in (1, 2, 3, 4) else 1
@@ -1068,6 +1112,31 @@ async def _processar_criacao_pei(
         except Exception as exc:
             levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado.")
 
+    # Indexa o PEI desta disciplina no pgvector do aluno (preservando os PEIs de outras disciplinas)
+    chunks_pei = dividir_texto_pei_em_chunks(
+        texto_pei=documento_gerado,
+        disciplina=componente,
+        nome_aluno=nome_aluno_limpo,
+    )
+    if chunks_pei:
+        await indexar_contexto_aluno_pgvector(
+            id_aluno=id_aluno,
+            origem="pei",
+            textos=chunks_pei,
+            disciplina=componente,
+            pei_id=pei_id,
+            substituir_origem_disciplina=True,
+            token=token_jwt,
+        )
+
+    from api.routes.dashboard_aluno import calcular_status_multi_pei_usuario
+
+    status_multi = calcular_status_multi_pei_usuario(
+        aluno=aluno,
+        tags_usuario=usuario_autenticado.get("tags") or [],
+        disciplina_recem_concluida=componente,
+    )
+
     resposta_obj = PeiCriarResponse(
         pei_id=pei_id,
         documento_gerado=documento_gerado,
@@ -1084,6 +1153,8 @@ async def _processar_criacao_pei(
         metas_bimestre=[MetaBimestreItem(**m) for m in metas_geradas],
         pei_feito=True,
         pei_valido_ate=pei_valido_ate,
+        todos_peis_concluidos=status_multi["todos_concluidos"],
+        disciplinas_pendentes=status_multi["pendentes"],
     )
     return resposta_obj, docx_bytes
 
@@ -1270,6 +1341,30 @@ async def importar_pei_arquivo(
         except Exception as exc:
             levantar_http_de_erro_db(exc, msg_nao_encontrado=f"Aluno {id_aluno} não encontrado.")
 
+    chunks_imp = dividir_texto_pei_em_chunks(
+        texto_pei=texto_limpo,
+        disciplina=componente,
+        nome_aluno=nome_aluno_limpo,
+    )
+    if chunks_imp:
+        await indexar_contexto_aluno_pgvector(
+            id_aluno=id_aluno,
+            origem="pei",
+            textos=chunks_imp,
+            disciplina=componente,
+            pei_id=pei_id,
+            substituir_origem_disciplina=True,
+            token=token_jwt,
+        )
+
+    from api.routes.dashboard_aluno import calcular_status_multi_pei_usuario
+
+    status_multi = calcular_status_multi_pei_usuario(
+        aluno=aluno,
+        tags_usuario=usuario_autenticado.get("tags") or [],
+        disciplina_recem_concluida=componente,
+    )
+
     return PeiCriarResponse(
         pei_id=pei_id,
         documento_gerado=texto_limpo,
@@ -1286,4 +1381,6 @@ async def importar_pei_arquivo(
         metas_bimestre=[MetaBimestreItem(**m) for m in metas_geradas],
         pei_feito=True,
         pei_valido_ate=pei_valido_ate,
+        todos_peis_concluidos=status_multi["todos_concluidos"],
+        disciplinas_pendentes=status_multi["pendentes"],
     )

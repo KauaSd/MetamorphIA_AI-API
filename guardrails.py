@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from typing import Any
+from typing import Any, Sequence
 
 PALAVRAS_CHAVE_ESCOPO = {
     "neurodivergente", "neurodivergência", "neurodiversidade", "tea", "autismo", "autista",
@@ -44,6 +44,13 @@ MENSAGEM_RECUSA_ESCOPO = (
     "(Planos Educacionais Individualizados). "
     "\n\nPor favor, envie uma dúvida ou solicitação relacionada à adaptação de conteúdos, "
     "estratégias de ensino inclusivo ou acompanhamento de estudantes."
+)
+
+MENSAGEM_RECUSA_PROGRAMACAO_OU_RESPOSTA = (
+    "Como assistente pedagógico da **MetamorphIA**, não gero códigos de programação, scripts, "
+    "algoritmos nem forneço respostas prontas ou gabaritos de exercícios e atividades. "
+    "Minha função é exclusivamente sugerir **estratégias de adaptação pedagógica** e recursos "
+    "inclusivos alinhados ao perfil e ao PEI do estudante."
 )
 
 MENSAGEM_ALERTA_INJECTION = (
@@ -200,6 +207,82 @@ _PADROES_FORA_ESCOPO_EXPLICITO = [
     re.compile(r"\bfa[çc]a\s+(?:esse|este|o|meu)\s+trabalho\b", re.IGNORECASE),
 ]
 
+_PADROES_PROGRAMACAO_OU_SCRIPT = [
+    re.compile(
+        r"\b(?:codigo|c[oó]digo|script|programa|algoritmo|fun[cç][aã]o|classe|sistema|api)\s+"
+        r"(?:em|de|com|usando|na\s+linguagem)\s+"
+        r"(?:python|javascript|typescript|java|c\+\+|c#|php|ruby|golang|rust|sql|html|css|bash|powershell|node)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:python|javascript|typescript|c\+\+|c#|golang|rust|powershell|sql|html|css|react|node\.js)\b"
+        r".{0,60}\b(?:codigo|c[oó]digo|script|gerar|escreva|crie|fazer|fa[cç]a|resolva|funcao|fun[cç][aã]o|loop|variavel|vari[aá]vel)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:gerar|escrev[ae]|cri[ae]|fa[cç]a|monte|gere|mand[ae])\s+"
+        r"(?:um\s+|o\s+)?(?:codigo|c[oó]digo|script|algoritmo|programa(?:\s+de\s+computador)?|promptscript)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bprompt\s*script\b", re.IGNORECASE),
+    re.compile(r"```(?:python|js|javascript|ts|typescript|java|sql|html|css|bash|sh|c|cpp|php)?\b", re.IGNORECASE),
+]
+
+_PADROES_RESPOSTA_PRONTA = [
+    re.compile(
+        r"\b(?:qual|me\s+d[eê]|diga|responda|resolva|calcule)\s+"
+        r"(?:a\s+|o\s+)?(?:resposta\s+(?:certa|correta)|gabarito|resultado\s+(?:de|da|do)|essa\s+conta|essa\s+equa[cç][aã]o|essa\s+quest[aã]o)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bresolva\s+(?:essa|esta|a|o)\s+(?:conta|equa[cç][aã]o|exerc[ií]cio|problema|atividade|quest[aã]o)\b", re.IGNORECASE),
+    re.compile(r"\b(?:escreva|fa[cç]a)\s+(?:uma|a|minha)\s+reda[cç][aã]o\b", re.IGNORECASE),
+]
+
+_PADROES_CODIGO_SAIDA = [
+    re.compile(r"```(?:python|js|javascript|ts|typescript|java|sql|html|css|bash|sh|c|cpp|php)?\s*\n", re.IGNORECASE),
+    re.compile(r"(?m)^\s*(?:def\s+\w+\s*\(|function\s+\w+\s*\(|class\s+\w+\s*[:{]|import\s+\w+|SELECT\s+.+\s+FROM\s+)", re.IGNORECASE),
+]
+
+
+def detectar_pedido_programacao_ou_resposta_pronta(texto: str) -> tuple[bool, str]:
+    """Bloqueia pedidos de código/scripts ou respostas prontas mesmo quando citam o aluno."""
+    if not texto:
+        return False, ""
+    texto_sem_acento = _remover_acentos(texto)
+    for padrao in _PADROES_PROGRAMACAO_OU_SCRIPT:
+        if padrao.search(texto) or padrao.search(texto_sem_acento):
+            return True, MENSAGEM_RECUSA_PROGRAMACAO_OU_RESPOSTA
+    for padrao in _PADROES_RESPOSTA_PRONTA:
+        if padrao.search(texto) or padrao.search(texto_sem_acento):
+            return True, MENSAGEM_RECUSA_PROGRAMACAO_OU_RESPOSTA
+    return False, ""
+
+
+def auditar_resposta_ia(resposta: str) -> str:
+    """Garante na saída que a IA nunca devolva blocos de código de programação."""
+    if not resposta:
+        return resposta
+    for padrao in _PADROES_CODIGO_SAIDA:
+        if padrao.search(resposta):
+            return MENSAGEM_RECUSA_PROGRAMACAO_OU_RESPOSTA
+    return resposta
+
+
+def _contem_nome_contexto(texto_lower: str, nomes_contexto: Sequence[str] | None) -> bool:
+    if not nomes_contexto:
+        return False
+    tokens_texto = set(re.findall(r"\b\w+\b", texto_lower))
+    for nome in nomes_contexto:
+        nome_norm = _remover_acentos((nome or "").strip().lower())
+        if not nome_norm:
+            continue
+        if len(nome_norm) >= 3 and re.search(rf"(?<!\w){re.escape(nome_norm)}(?!\w)", texto_lower):
+            return True
+        for parte in re.findall(r"\b\w+\b", nome_norm):
+            if len(parte) >= 3 and parte in tokens_texto:
+                return True
+    return False
+
 
 def eh_pedido_explicitamente_fora_escopo(texto: str) -> bool:
     if not texto:
@@ -210,17 +293,31 @@ def eh_pedido_explicitamente_fora_escopo(texto: str) -> bool:
     return any(p.search(texto) for p in _PADROES_FORA_ESCOPO_EXPLICITO)
 
 
-def validar_escopo_pedagogico(texto: str) -> tuple[bool, str]:
+def validar_escopo_pedagogico(
+    texto: str,
+    nomes_contexto: Sequence[str] | None = None,
+    similaridade_vetorial: float | None = None,
+) -> tuple[bool, str]:
     if not texto or not texto.strip():
         return False, "Por favor, digite sua pergunta pedagógica ou solicitação de adaptação."
 
     texto_limpo = texto.strip()
     texto_lower = _remover_acentos(texto_limpo.lower())
 
+    eh_proibido, msg_proibicao = detectar_pedido_programacao_ou_resposta_pronta(texto_limpo)
+    if eh_proibido:
+        return False, msg_proibicao
+
     if eh_pedido_explicitamente_fora_escopo(texto_limpo):
         return False, MENSAGEM_RECUSA_ESCOPO
 
     if any(p.search(texto_lower) for p in _PADROES_ESCOPO):
+        return True, ""
+
+    if _contem_nome_contexto(texto_lower, nomes_contexto):
+        return True, ""
+
+    if similaridade_vetorial is not None and float(similaridade_vetorial) >= 0.35:
         return True, ""
 
     if _PADRAO_SAUDACAO_OU_CONVERSACIONAL.match(texto_limpo):
@@ -264,13 +361,20 @@ def garantir_referencias_finais(
 
 
 def validar_e_higienizar_entrada(
-    mensagem_usuario: str, bloquear_se_houver_pii: bool = True
+    mensagem_usuario: str,
+    bloquear_se_houver_pii: bool = True,
+    nomes_contexto: Sequence[str] | None = None,
+    similaridade_vetorial: float | None = None,
 ) -> tuple[bool, str, str]:
     eh_ataque, msg_injection = detectar_prompt_injection(mensagem_usuario)
     if eh_ataque:
         return False, "", msg_injection
 
-    no_escopo, msg_escopo = validar_escopo_pedagogico(mensagem_usuario)
+    no_escopo, msg_escopo = validar_escopo_pedagogico(
+        mensagem_usuario,
+        nomes_contexto=nomes_contexto,
+        similaridade_vetorial=similaridade_vetorial,
+    )
     if not no_escopo:
         return False, "", msg_escopo
 
