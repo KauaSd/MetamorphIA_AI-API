@@ -110,10 +110,10 @@ async def verificar_token_jwt(
             detail="Token inválido: identificador de usuário ausente",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    if payload.get("is_verified") is not True or payload.get("2fa"):
+    if payload.get("is_verified") is not True:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token não verificado ou pendente de segundo fator (2FA)",
+            detail="Token não verificado",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
